@@ -1,0 +1,308 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import http from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { BinanceApiError, BinanceClient, TESTNET_API_BASE } from './binance-client.js';
+import { STRATEGY_CATALOG, STRATEGY_SYMBOLS, StrategyStore } from './strategies.js';
+
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const publicDir = path.join(rootDir, 'public');
+const port = Number(process.env.PORT || 3173);
+const host = process.env.HOST || '127.0.0.1';
+const sessionTtlMs = Number(process.env.SESSION_TTL_MINUTES || 30) * 60_000;
+const apiBase = process.env.BINANCE_API_BASE || TESTNET_API_BASE;
+const strategyStore = new StrategyStore(path.join(rootDir, 'data', 'config', 'strategies.json'));
+const sessions = new Map();
+const requestBuckets = new Map();
+
+const mimeTypes = {
+  '.css': 'text/css; charset=utf-8',
+  '.html': 'text/html; charset=utf-8',
+  '.ico': 'image/x-icon',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+};
+
+function securityHeaders() {
+  return {
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+  };
+}
+
+function sendJson(res, status, body, headers = {}) {
+  res.writeHead(status, {
+    ...securityHeaders(),
+    'Content-Type': 'application/json; charset=utf-8',
+    ...headers,
+  });
+  res.end(JSON.stringify(body));
+}
+
+async function readJson(req) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 16_384) throw Object.assign(new Error('请求内容过大'), { status: 413 });
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw Object.assign(new Error('请求 JSON 格式无效'), { status: 400 });
+  }
+}
+
+function cookies(req) {
+  return Object.fromEntries(
+    (req.headers.cookie || '')
+      .split(';')
+      .map((part) => part.trim().split('='))
+      .filter(([key]) => key)
+      .map(([key, value]) => [key, decodeURIComponent(value || '')]),
+  );
+}
+
+function sessionFor(req) {
+  const id = cookies(req).qsession;
+  const session = id ? sessions.get(id) : null;
+  if (!session) return null;
+  if (session.expiresAt < Date.now()) {
+    sessions.delete(id);
+    return null;
+  }
+  session.expiresAt = Date.now() + sessionTtlMs;
+  return { id, ...session };
+}
+
+function requireSession(req) {
+  const session = sessionFor(req);
+  if (!session) throw Object.assign(new Error('API 会话已失效，请重新连接'), { status: 401 });
+  return session;
+}
+
+function clientFor(session = {}) {
+  return new BinanceClient({
+    apiKey: session.apiKey,
+    apiSecret: session.apiSecret,
+    baseUrl: apiBase,
+  });
+}
+
+function validateSymbol(value) {
+  const symbol = String(value || '').trim().toUpperCase();
+  if (!/^[A-Z0-9]{5,20}$/.test(symbol)) {
+    throw Object.assign(new Error('交易对格式无效'), { status: 400 });
+  }
+  return symbol;
+}
+
+function rateLimited(req) {
+  const key = req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const bucket = requestBuckets.get(key) || { startedAt: now, count: 0 };
+  if (now - bucket.startedAt > 60_000) {
+    bucket.startedAt = now;
+    bucket.count = 0;
+  }
+  bucket.count += 1;
+  requestBuckets.set(key, bucket);
+  return bucket.count > 120;
+}
+
+async function apiRoute(req, res, url) {
+  if (rateLimited(req)) return sendJson(res, 429, { error: '请求过于频繁，请稍后重试' });
+
+  if (req.method === 'GET' && url.pathname === '/api/health') {
+    return sendJson(res, 200, { status: 'ok', environment: 'spot-testnet' });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/strategies/catalog') {
+    return sendJson(res, 200, {
+      executionMode: 'CONFIG_ONLY',
+      warning: '启用仅代表进入观察状态，当前不会自动下单',
+      symbols: STRATEGY_SYMBOLS,
+      strategies: Object.values(STRATEGY_CATALOG),
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/strategies') {
+    return sendJson(res, 200, { strategies: await strategyStore.list() });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/strategies') {
+    const strategy = await strategyStore.create(await readJson(req));
+    return sendJson(res, 201, { strategy });
+  }
+
+  const strategyMatch = url.pathname.match(/^\/api\/strategies\/([a-f0-9-]+)$/);
+  if (strategyMatch) {
+    const id = strategyMatch[1];
+    if (req.method === 'PUT') {
+      return sendJson(res, 200, { strategy: await strategyStore.update(id, await readJson(req)) });
+    }
+    if (req.method === 'PATCH') {
+      const body = await readJson(req);
+      if (typeof body.enabled !== 'boolean') throw Object.assign(new Error('启停状态无效'), { status: 400 });
+      return sendJson(res, 200, { strategy: await strategyStore.setEnabled(id, body.enabled) });
+    }
+    if (req.method === 'DELETE') {
+      await strategyStore.delete(id);
+      return sendJson(res, 200, { deleted: true });
+    }
+  }
+
+  const cloneMatch = url.pathname.match(/^\/api\/strategies\/([a-f0-9-]+)\/clone$/);
+  if (req.method === 'POST' && cloneMatch) {
+    return sendJson(res, 201, { strategy: await strategyStore.clone(cloneMatch[1]) });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/session') {
+    const session = sessionFor(req);
+    return sendJson(res, 200, {
+      connected: Boolean(session),
+      apiKeyHint: session ? `${session.apiKey.slice(0, 4)}••••${session.apiKey.slice(-4)}` : null,
+      environment: 'Binance Spot Testnet',
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/session') {
+    const { apiKey, apiSecret } = await readJson(req);
+    if (typeof apiKey !== 'string' || apiKey.trim().length < 16) {
+      throw Object.assign(new Error('请输入有效的 API Key'), { status: 400 });
+    }
+    if (typeof apiSecret !== 'string' || apiSecret.trim().length < 16) {
+      throw Object.assign(new Error('请输入有效的 Secret Key'), { status: 400 });
+    }
+
+    const credentials = { apiKey: apiKey.trim(), apiSecret: apiSecret.trim() };
+    const client = clientFor(credentials);
+    const account = await client.account();
+    const id = crypto.randomUUID();
+    sessions.set(id, { ...credentials, expiresAt: Date.now() + sessionTtlMs });
+    return sendJson(
+      res,
+      201,
+      { connected: true, canTrade: account.canTrade, accountType: account.accountType },
+      { 'Set-Cookie': `qsession=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(sessionTtlMs / 1000)}` },
+    );
+  }
+
+  if (req.method === 'DELETE' && url.pathname === '/api/session') {
+    const session = sessionFor(req);
+    if (session) sessions.delete(session.id);
+    return sendJson(res, 200, { connected: false }, {
+      'Set-Cookie': 'qsession=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/market') {
+    const symbol = validateSymbol(url.searchParams.get('symbol') || 'BTCUSDT');
+    const client = clientFor();
+    const [ticker, klines] = await Promise.all([
+      client.publicRequest('/api/v3/ticker/24hr', { symbol }),
+      client.publicRequest('/api/v3/klines', { symbol, interval: '15m', limit: 60 }),
+    ]);
+    return sendJson(res, 200, {
+      symbol,
+      ticker: {
+        lastPrice: ticker.lastPrice,
+        priceChangePercent: ticker.priceChangePercent,
+        highPrice: ticker.highPrice,
+        lowPrice: ticker.lowPrice,
+        quoteVolume: ticker.quoteVolume,
+      },
+      candles: klines.map((item) => ({
+        time: item[0], open: item[1], high: item[2], low: item[3], close: item[4], volume: item[5],
+      })),
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/account') {
+    const account = await clientFor(requireSession(req)).account();
+    const balances = account.balances
+      .filter((item) => Number(item.free) || Number(item.locked))
+      .sort((a, b) => Number(b.free) + Number(b.locked) - Number(a.free) - Number(a.locked));
+    return sendJson(res, 200, {
+      canTrade: account.canTrade,
+      accountType: account.accountType,
+      balances,
+      updatedAt: account.updateTime || Date.now(),
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/orders/test') {
+    const session = requireSession(req);
+    const body = await readJson(req);
+    const symbol = validateSymbol(body.symbol);
+    const side = String(body.side || '').toUpperCase();
+    if (!['BUY', 'SELL'].includes(side)) {
+      throw Object.assign(new Error('买卖方向无效'), { status: 400 });
+    }
+    const amount = String(body.amount || '').trim();
+    if (!/^\d+(\.\d+)?$/.test(amount) || Number(amount) <= 0) {
+      throw Object.assign(new Error('下单数量必须大于 0'), { status: 400 });
+    }
+
+    const order = { symbol, side, type: 'MARKET' };
+    if (side === 'BUY') order.quoteOrderQty = amount;
+    else order.quantity = amount;
+    await clientFor(session).testOrder(order);
+    return sendJson(res, 200, {
+      validated: true,
+      message: '测试订单校验通过，未进入撮合，也不会产生真实成交',
+      order,
+      testedAt: Date.now(),
+    });
+  }
+
+  return sendJson(res, 404, { error: '接口不存在' });
+}
+
+async function staticRoute(req, res, url) {
+  if (!['GET', 'HEAD'].includes(req.method)) return sendJson(res, 405, { error: '请求方法不支持' });
+  const requested = url.pathname === '/' ? '/index.html' : url.pathname;
+  const filePath = path.resolve(publicDir, `.${requested}`);
+  if (!filePath.startsWith(`${publicDir}${path.sep}`)) return sendJson(res, 403, { error: '拒绝访问' });
+  try {
+    const content = await fs.readFile(filePath);
+    res.writeHead(200, {
+      ...securityHeaders(),
+      'Cache-Control': requested === '/index.html' ? 'no-cache' : 'public, max-age=3600',
+      'Content-Type': mimeTypes[path.extname(filePath)] || 'application/octet-stream',
+    });
+    if (req.method === 'HEAD') return res.end();
+    return res.end(content);
+  } catch (error) {
+    if (error.code === 'ENOENT') return sendJson(res, 404, { error: '页面不存在' });
+    throw error;
+  }
+}
+
+export const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  try {
+    if (url.pathname.startsWith('/api/')) await apiRoute(req, res, url);
+    else await staticRoute(req, res, url);
+  } catch (error) {
+    const status = error.status || 500;
+    const message = error instanceof BinanceApiError ? error.message : (status < 500 ? error.message : '服务器暂时不可用');
+    if (status >= 500) console.error('[server]', error.name, error.message);
+    sendJson(res, status, { error: message, code: error.code || null });
+  }
+});
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  server.listen(port, host, () => {
+    console.log(`QuantFlow 已启动：http://${host}:${port}`);
+    console.log('当前环境：Binance Spot Testnet（测试网）');
+  });
+}

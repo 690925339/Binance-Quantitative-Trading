@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#0b0c0e">
+    <meta name="description" content="QuantFlow 币安现货测试网量化交易基础版">
+    <title>QuantFlow · 币安量化测试台</title>
+    <link rel="stylesheet" href="/styles.css?v=20260715-okx">
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="#dashboard" aria-label="QuantFlow 首页">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <span>Quant<span class="brand-accent">Flow</span></span>
+        </a>
+        <button class="status-pill" id="connectionButton" type="button" data-target="settings">
+          <span class="status-dot"></span>
+          <span id="connectionText">未连接</span>
+        </button>
+      </header>
+
+      <main>
+        <section class="page active" id="dashboardPage" data-page="dashboard">
+          <div class="hero-row">
+            <div>
+              <p class="eyebrow">BINANCE SPOT · TESTNET</p>
+              <h1>交易总览</h1>
+              <p class="subtitle">行情、策略和风险状态集中管理</p>
+            </div>
+            <div class="market-pulse" aria-label="系统运行中">
+              <span></span><span></span><span></span><span></span>
+            </div>
+          </div>
+
+          <section class="quick-actions" aria-label="快捷操作">
+            <button type="button" data-target="strategies"><span class="quick-icon">▦</span><b>策略</b><small>配置机器人</small></button>
+            <button type="button" data-target="trade"><span class="quick-icon">⇅</span><b>测试交易</b><small>校验订单</small></button>
+            <button type="button" data-target="assets"><span class="quick-icon">◇</span><b>资产</b><small>测试账户</small></button>
+            <button type="button" data-target="settings"><span class="quick-icon">⌁</span><b>API</b><small>连接设置</small></button>
+          </section>
+
+          <section class="card market-card">
+            <div class="card-head">
+              <label class="symbol-select">
+                <span class="coin-icon">₿</span>
+                <select id="marketSymbol" aria-label="选择交易对">
+                  <option value="BTCUSDT">BTC / USDT</option>
+                  <option value="ETHUSDT">ETH / USDT</option>
+                  <option value="BNBUSDT">BNB / USDT</option>
+                  <option value="SOLUSDT">SOL / USDT</option>
+                </select>
+              </label>
+              <span class="live-badge"><i></i> 模拟行情</span>
+            </div>
+            <div class="price-row">
+              <div>
+                <strong class="price" id="lastPrice">--</strong>
+                <span class="price-unit">USDT</span>
+              </div>
+              <span class="change neutral" id="priceChange">--</span>
+            </div>
+            <div class="chart-wrap">
+              <canvas id="priceChart" aria-label="15 分钟价格走势"></canvas>
+              <div class="chart-loading" id="chartLoading">正在同步行情…</div>
+            </div>
+            <div class="market-stats">
+              <div><span>24h 最高</span><strong id="highPrice">--</strong></div>
+              <div><span>24h 最低</span><strong id="lowPrice">--</strong></div>
+              <div><span>24h 成交额</span><strong id="quoteVolume">--</strong></div>
+            </div>
+          </section>
+
+          <div class="section-title">
+            <div><p class="eyebrow">STRATEGY</p><h2>策略信号</h2></div>
+            <span class="safe-label">仅观察</span>
+          </div>
+
+          <section class="card strategy-card">
+            <div class="strategy-icon"><span></span></div>
+            <div class="strategy-info">
+              <div class="strategy-title"><strong>双均线趋势观察</strong><span id="signalBadge">分析中</span></div>
+              <p>MA5 与 MA20 · 15 分钟周期</p>
+              <div class="strategy-metrics">
+                <span>MA5 <b id="ma5">--</b></span>
+                <span>MA20 <b id="ma20">--</b></span>
+              </div>
+            </div>
+            <button class="card-link" type="button" data-target="strategies" aria-label="管理策略">›</button>
+          </section>
+
+          <section class="notice">
+            <span class="notice-icon">!</span>
+            <p><strong>测试环境</strong> 当前不会自动交易。策略只生成观察信号，测试订单也不会进入撮合。</p>
+          </section>
+        </section>
+
+        <section class="page" id="strategiesPage" data-page="strategies">
+          <div class="page-heading strategy-heading">
+            <div>
+              <p class="eyebrow">STRATEGY CENTER</p>
+              <h1>策略中心</h1>
+              <p>配置参数、资金边界和观察状态，暂不自动下单。</p>
+            </div>
+            <button class="round-add-button" id="newStrategyButton" type="button" aria-label="新建策略">＋</button>
+          </div>
+
+          <section class="strategy-overview card">
+            <div><span>已配置</span><strong id="strategyCount">0</strong><small>个策略</small></div>
+            <i></i>
+            <div><span>观察中</span><strong id="enabledStrategyCount">0</strong><small>不下单</small></div>
+            <span class="config-only-badge">CONFIG ONLY</span>
+          </section>
+
+          <div class="section-title strategy-section-title">
+            <div><p class="eyebrow">TEMPLATES</p><h2>选择基础策略</h2></div>
+          </div>
+          <div class="strategy-template-grid" id="strategyTemplates">
+            <div class="template-skeleton"></div><div class="template-skeleton"></div>
+          </div>
+
+          <div class="section-title strategy-section-title">
+            <div><p class="eyebrow">MY STRATEGIES</p><h2>我的配置</h2></div>
+          </div>
+          <div class="configured-strategy-list" id="strategyList">
+            <div class="empty-state strategy-empty"><span>＋</span><strong>还没有策略配置</strong><p>从上方模板创建第一套参数</p></div>
+          </div>
+
+          <section class="notice strategy-notice">
+            <span class="notice-icon">!</span>
+            <p><strong>执行边界</strong> “启用”仅表示进入观察状态。接入回测、风控和执行器前，任何策略都不会调用下单接口。</p>
+          </section>
+        </section>
+
+        <section class="page" id="tradePage" data-page="trade">
+          <div class="page-heading">
+            <p class="eyebrow">ORDER VALIDATION</p>
+            <h1>测试下单</h1>
+            <p>验证签名、权限与交易参数，不产生订单。</p>
+          </div>
+
+          <form class="card order-form" id="orderForm">
+            <label>
+              <span>交易对</span>
+              <select id="orderSymbol" name="symbol">
+                <option value="BTCUSDT">BTC / USDT</option>
+                <option value="ETHUSDT">ETH / USDT</option>
+                <option value="BNBUSDT">BNB / USDT</option>
+                <option value="SOLUSDT">SOL / USDT</option>
+              </select>
+            </label>
+            <fieldset>
+              <legend>方向</legend>
+              <div class="segmented">
+                <label><input type="radio" name="side" value="BUY" checked><span>买入</span></label>
+                <label><input type="radio" name="side" value="SELL"><span>卖出</span></label>
+              </div>
+            </fieldset>
+            <label>
+              <span id="amountLabel">花费金额（USDT）</span>
+              <div class="input-unit"><input id="orderAmount" name="amount" inputmode="decimal" placeholder="例如 20" autocomplete="off"><b id="amountUnit">USDT</b></div>
+            </label>
+            <div class="order-summary">
+              <span>订单类型</span><strong>MARKET · TEST</strong>
+            </div>
+            <button class="primary-button" type="submit" id="testOrderButton">校验测试订单</button>
+          </form>
+
+          <div class="result-card hidden" id="orderResult" role="status"></div>
+        </section>
+
+        <section class="page" id="assetsPage" data-page="assets">
+          <div class="page-heading">
+            <p class="eyebrow">TESTNET WALLET</p>
+            <h1>测试资产</h1>
+            <p>仅显示测试网账户中的非零资产。</p>
+          </div>
+          <div class="asset-summary card">
+            <span>账户状态</span>
+            <strong id="accountStatus">等待连接</strong>
+            <small id="accountType">Binance Spot Testnet</small>
+          </div>
+          <div class="asset-list" id="assetList">
+            <div class="empty-state"><span>◇</span><strong>尚未加载资产</strong><p>先在 API 设置中连接测试网账号</p></div>
+          </div>
+          <button class="secondary-button" id="refreshAssets" type="button">刷新资产</button>
+        </section>
+
+        <section class="page" id="settingsPage" data-page="settings">
+          <div class="page-heading">
+            <p class="eyebrow">API CONNECTION</p>
+            <h1>API 设置</h1>
+            <p>凭证仅保存在服务端内存，会话到期或服务重启后自动清除。</p>
+          </div>
+
+          <section class="security-banner">
+            <div class="shield">✓</div>
+            <div><strong>现货测试网专用</strong><p>请勿填写币安正式网 API Key。本版本不会持久化密钥。</p></div>
+          </section>
+
+          <form class="card api-form" id="apiForm">
+            <label>
+              <span>API Key</span>
+              <input id="apiKey" name="apiKey" type="text" autocomplete="off" spellcheck="false" placeholder="粘贴 Testnet API Key">
+            </label>
+            <label>
+              <span>Secret Key</span>
+              <div class="password-input">
+                <input id="apiSecret" name="apiSecret" type="password" autocomplete="new-password" spellcheck="false" placeholder="仅发送到本机服务端">
+                <button id="toggleSecret" type="button" aria-label="显示或隐藏 Secret">显示</button>
+              </div>
+            </label>
+            <button class="primary-button" type="submit" id="connectApiButton">连接并验证</button>
+            <button class="danger-button hidden" type="button" id="disconnectButton">清除 API 会话</button>
+          </form>
+
+          <ol class="steps">
+            <li><span>1</span><p>登录 Binance Spot Testnet 创建 HMAC API Key。</p></li>
+            <li><span>2</span><p>为测试交易开启所需权限，不要使用正式网密钥。</p></li>
+            <li><span>3</span><p>连接后先查看资产，再用小额参数测试订单。</p></li>
+          </ol>
+        </section>
+      </main>
+
+      <nav class="bottom-nav" aria-label="主导航">
+        <button class="active" type="button" data-target="dashboard"><span class="nav-icon">⌁</span><span>行情</span></button>
+        <button type="button" data-target="strategies"><span class="nav-icon">▦</span><span>策略</span></button>
+        <button type="button" data-target="trade"><span class="nav-icon">⇅</span><span>交易</span></button>
+        <button type="button" data-target="assets"><span class="nav-icon">◇</span><span>资产</span></button>
+        <button type="button" data-target="settings"><span class="nav-icon">⚙</span><span>设置</span></button>
+      </nav>
+    </div>
+
+    <div class="modal-overlay hidden" id="strategyModal" role="dialog" aria-modal="true" aria-labelledby="strategyModalTitle">
+      <form class="strategy-modal" id="strategyForm">
+        <header class="modal-header">
+          <div><p class="eyebrow" id="strategyModalEyebrow">NEW STRATEGY</p><h2 id="strategyModalTitle">配置策略</h2></div>
+          <button class="modal-close" id="closeStrategyModal" type="button" aria-label="关闭策略配置">×</button>
+        </header>
+        <div class="modal-scroll">
+          <input id="strategyType" name="type" type="hidden">
+          <div class="form-grid common-fields">
+            <label class="full-field">
+              <span>策略名称</span>
+              <input id="strategyName" name="name" maxlength="40" placeholder="例如 BTC 震荡网格" autocomplete="off">
+            </label>
+            <label class="full-field">
+              <span>交易对</span>
+              <select id="strategySymbol" name="symbol"></select>
+            </label>
+          </div>
+          <div class="strategy-type-note" id="strategyTypeNote"></div>
+          <div class="form-grid dynamic-strategy-fields" id="strategyFields"></div>
+          <section class="risk-preview" id="strategyRiskPreview">
+            <div class="risk-preview-head"><span>资金与风险预估</span><b>配置阶段</b></div>
+            <div class="risk-metrics" id="riskMetrics"></div>
+            <p id="riskWarning">保存后由服务端执行完整参数校验。</p>
+          </section>
+        </div>
+        <footer class="modal-footer">
+          <button class="secondary-button modal-cancel" id="cancelStrategyButton" type="button">取消</button>
+          <button class="primary-button" id="saveStrategyButton" type="submit">保存配置</button>
+        </footer>
+      </form>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/app.js?v=20260715-okx"></script>
+  </body>
+</html>

@@ -1,0 +1,172 @@
+{
+  "generatedAt": "2026-07-15T08:49:23.881Z",
+  "source": "https://data-api.binance.vision/api/v3/klines",
+  "market": "Binance Spot",
+  "quoteAsset": "USDT",
+  "interval": "1h",
+  "requestedStartTimeUtc": "2023-01-01T00:00:00.000Z",
+  "requestedEndTimeUtc": "2026-07-15T07:59:59.999Z",
+  "columns": [
+    "symbol",
+    "interval",
+    "open_time",
+    "open_time_utc",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_time",
+    "close_time_utc",
+    "quote_volume",
+    "trades",
+    "taker_buy_base_volume",
+    "taker_buy_quote_volume"
+  ],
+  "datasets": [
+    {
+      "symbol": "BTCUSDT",
+      "interval": "1h",
+      "file": "BTCUSDT-1h.csv",
+      "rows": 30991,
+      "firstOpenTime": 1672531200000,
+      "firstOpenTimeUtc": "2023-01-01T00:00:00.000Z",
+      "lastOpenTime": 1784098800000,
+      "lastOpenTimeUtc": "2026-07-15T07:00:00.000Z",
+      "sha256": "e44afa185144269a5a9fbb2a81b21000bf277bd202e8da087ebd679269b581a4",
+      "quality": {
+        "gaps": 1,
+        "gapRanges": [
+          {
+            "fromOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "toOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "missingCandles": 1
+          }
+        ],
+        "duplicates": 0,
+        "invalidOhlc": 0,
+        "nonPositivePrice": 0
+      }
+    },
+    {
+      "symbol": "ETHUSDT",
+      "interval": "1h",
+      "file": "ETHUSDT-1h.csv",
+      "rows": 30991,
+      "firstOpenTime": 1672531200000,
+      "firstOpenTimeUtc": "2023-01-01T00:00:00.000Z",
+      "lastOpenTime": 1784098800000,
+      "lastOpenTimeUtc": "2026-07-15T07:00:00.000Z",
+      "sha256": "dc79278a01f5df6c4e79d2296d74b30057f204f402601bc5b93cf4f8cc32bb23",
+      "quality": {
+        "gaps": 1,
+        "gapRanges": [
+          {
+            "fromOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "toOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "missingCandles": 1
+          }
+        ],
+        "duplicates": 0,
+        "invalidOhlc": 0,
+        "nonPositivePrice": 0
+      }
+    },
+    {
+      "symbol": "BNBUSDT",
+      "interval": "1h",
+      "file": "BNBUSDT-1h.csv",
+      "rows": 30991,
+      "firstOpenTime": 1672531200000,
+      "firstOpenTimeUtc": "2023-01-01T00:00:00.000Z",
+      "lastOpenTime": 1784098800000,
+      "lastOpenTimeUtc": "2026-07-15T07:00:00.000Z",
+      "sha256": "ed865a9f6e675d4af212724d3cbe54037622f362650044bc97ab234172f2d96c",
+      "quality": {
+        "gaps": 1,
+        "gapRanges": [
+          {
+            "fromOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "toOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "missingCandles": 1
+          }
+        ],
+        "duplicates": 0,
+        "invalidOhlc": 0,
+        "nonPositivePrice": 0
+      }
+    },
+    {
+      "symbol": "SOLUSDT",
+      "interval": "1h",
+      "file": "SOLUSDT-1h.csv",
+      "rows": 30991,
+      "firstOpenTime": 1672531200000,
+      "firstOpenTimeUtc": "2023-01-01T00:00:00.000Z",
+      "lastOpenTime": 1784098800000,
+      "lastOpenTimeUtc": "2026-07-15T07:00:00.000Z",
+      "sha256": "8e7f148f33ff304424fab7bd329bf1dd8c3d97febdb1f8c246cc89840edaa411",
+      "quality": {
+        "gaps": 1,
+        "gapRanges": [
+          {
+            "fromOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "toOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "missingCandles": 1
+          }
+        ],
+        "duplicates": 0,
+        "invalidOhlc": 0,
+        "nonPositivePrice": 0
+      }
+    },
+    {
+      "symbol": "XRPUSDT",
+      "interval": "1h",
+      "file": "XRPUSDT-1h.csv",
+      "rows": 30991,
+      "firstOpenTime": 1672531200000,
+      "firstOpenTimeUtc": "2023-01-01T00:00:00.000Z",
+      "lastOpenTime": 1784098800000,
+      "lastOpenTimeUtc": "2026-07-15T07:00:00.000Z",
+      "sha256": "ada4dd1f1312f086d17fdd3abf74c9a8241bb3c90a255fe9b05efab8f4a7caf1",
+      "quality": {
+        "gaps": 1,
+        "gapRanges": [
+          {
+            "fromOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "toOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "missingCandles": 1
+          }
+        ],
+        "duplicates": 0,
+        "invalidOhlc": 0,
+        "nonPositivePrice": 0
+      }
+    },
+    {
+      "symbol": "DOGEUSDT",
+      "interval": "1h",
+      "file": "DOGEUSDT-1h.csv",
+      "rows": 30991,
+      "firstOpenTime": 1672531200000,
+      "firstOpenTimeUtc": "2023-01-01T00:00:00.000Z",
+      "lastOpenTime": 1784098800000,
+      "lastOpenTimeUtc": "2026-07-15T07:00:00.000Z",
+      "sha256": "dc93533b5fd7005352275892dcf2413e49cf4bec066f49f0818bca9a05373165",
+      "quality": {
+        "gaps": 1,
+        "gapRanges": [
+          {
+            "fromOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "toOpenTimeUtc": "2023-03-24T13:00:00.000Z",
+            "missingCandles": 1
+          }
+        ],
+        "duplicates": 0,
+        "invalidOhlc": 0,
+        "nonPositivePrice": 0
+      }
+    }
+  ]
+}

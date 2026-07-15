@@ -1,0 +1,19 @@
+{
+  "name": "binance-quantitative-trading",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "移动端币安现货测试网量化交易基础版",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "data:download": "node scripts/download-market-data.mjs",
+    "data:workbook": "node scripts/build-market-data-workbook.mjs",
+    "data:verify": "node scripts/verify-market-data.mjs",
+    "test": "node --test",
+    "check": "node --check src/server.js && node --check src/binance-client.js && node --check public/app.js && node --check scripts/download-market-data.mjs && node --check scripts/build-market-data-workbook.mjs && node --check scripts/verify-market-data.mjs && node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
