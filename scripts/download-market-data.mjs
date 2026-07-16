@@ -176,8 +176,16 @@ export async function downloadSymbol({
       endTime: String(endTime),
       limit: '1000',
     });
-    const pageRows = await fetchJson(`${baseUrl}/api/v3/klines?${query}`, fetchImpl);
-    if (!Array.isArray(pageRows)) throw new Error(`${symbol} K线响应格式异常`);
+    const url = `${baseUrl}/api/v3/klines?${query}`;
+    let pageRows = null;
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      pageRows = await fetchJson(url, fetchImpl);
+      if (Array.isArray(pageRows)) break;
+      if (attempt < 5) await wait(500 * (2 ** (attempt - 1)));
+    }
+    if (!Array.isArray(pageRows)) {
+      throw new Error(`${symbol} K线响应格式异常：${pageRows?.msg || '未知响应'}`);
+    }
     if (pageRows.length === 0) break;
 
     for (const row of pageRows) {
@@ -247,7 +255,7 @@ export async function main(argv = process.argv.slice(2)) {
     throw new Error('交易对参数无效');
   }
 
-  const startTime = parseUtcDate(args.start || '2023-01-01');
+  const startTime = parseUtcDate(args.start || '2022-07-01');
   const requestedEnd = parseUtcDate(args.end, true);
   const endTime = Math.min(requestedEnd ?? Number.MAX_SAFE_INTEGER, lastCompleteCloseTime(Date.now(), intervalMs));
   if (startTime > endTime) throw new Error('开始时间必须早于结束时间');

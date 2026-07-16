@@ -1,0 +1,43 @@
+{
+  "generatedAt": "2026-07-16T01:47:44.877Z",
+  "source": "https://data.binance.vision/data/futures/um/monthly",
+  "requestedMonths": {
+    "start": "2023-01",
+    "end": "2026-06"
+  },
+  "datasets": [
+    {
+      "symbol": "BTCUSDT",
+      "file": "BTCUSDT-funding.csv",
+      "rows": 3825,
+      "sourceRows": 3831,
+      "unmatchedRows": 6,
+      "duplicateTimes": 0,
+      "firstFundingTimeUtc": "2023-01-01T00:00:00.000Z",
+      "lastFundingTimeUtc": "2026-06-30T16:00:00.005Z",
+      "sha256": "f5ffdea2d14d706ace65e1f89334bfee95a5201cd626a814922e51fbefd13200"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "file": "ETHUSDT-funding.csv",
+      "rows": 3825,
+      "sourceRows": 3831,
+      "unmatchedRows": 6,
+      "duplicateTimes": 0,
+      "firstFundingTimeUtc": "2023-01-01T00:00:00.000Z",
+      "lastFundingTimeUtc": "2026-06-30T16:00:00.005Z",
+      "sha256": "87ffc793b13c7aeedcbea61f8e92963fec5644920a68a9339476d7e3586f400c"
+    },
+    {
+      "symbol": "BNBUSDT",
+      "file": "BNBUSDT-funding.csv",
+      "rows": 3825,
+      "sourceRows": 3831,
+      "unmatchedRows": 6,
+      "duplicateTimes": 0,
+      "firstFundingTimeUtc": "2023-01-01T00:00:00.000Z",
+      "lastFundingTimeUtc": "2026-06-30T16:00:00.005Z",
+      "sha256": "3d240df32d7606406c9c1a27bb87b6658ac41e2bf7f90b248ebe8a89b64ccd03"
+    }
+  ]
+}

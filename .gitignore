@@ -9,3 +9,4 @@ Thumbs.db
 outputs/**/qa/
 outputs/**/*.inspect.ndjson
 outputs/**/*-preview.png
+data/runtime/

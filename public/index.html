@@ -6,7 +6,8 @@
     <meta name="theme-color" content="#0b0c0e">
     <meta name="description" content="QuantFlow 币安现货测试网量化交易基础版">
     <title>QuantFlow · 币安量化测试台</title>
-    <link rel="stylesheet" href="/styles.css?v=20260715-okx">
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/styles.css?v=20260716-paper-trading">
   </head>
   <body>
     <div class="app-shell">
@@ -36,9 +37,9 @@
 
           <section class="quick-actions" aria-label="快捷操作">
             <button type="button" data-target="strategies"><span class="quick-icon">▦</span><b>策略</b><small>配置机器人</small></button>
-            <button type="button" data-target="trade"><span class="quick-icon">⇅</span><b>测试交易</b><small>校验订单</small></button>
+            <button type="button" data-target="paper"><span class="quick-icon">◎</span><b>模拟盘</b><small>每日盈亏</small></button>
             <button type="button" data-target="assets"><span class="quick-icon">◇</span><b>资产</b><small>测试账户</small></button>
-            <button type="button" data-target="settings"><span class="quick-icon">⌁</span><b>API</b><small>连接设置</small></button>
+            <button type="button" data-target="news"><span class="quick-icon">◉</span><b>新闻</b><small>市场动态</small></button>
           </section>
 
           <section class="card market-card">
@@ -130,6 +131,103 @@
           <section class="notice strategy-notice">
             <span class="notice-icon">!</span>
             <p><strong>执行边界</strong> “启用”仅表示进入观察状态。接入回测、风控和执行器前，任何策略都不会调用下单接口。</p>
+          </section>
+        </section>
+
+        <section class="page" id="newsPage" data-page="news">
+          <div class="page-heading news-heading">
+            <div>
+              <p class="eyebrow">LIVE NEWS SIGNAL</p>
+              <h1>实时新闻</h1>
+              <p>聚合新闻方向、可信度与策略参考权重。</p>
+            </div>
+            <span id="newsRefreshState">每 60 秒刷新</span>
+          </div>
+
+          <label class="card news-symbol-selector">
+            <span>策略参考交易对</span>
+            <select id="newsSymbol">
+              <option value="BTCUSDT">BTC / USDT</option>
+              <option value="ETHUSDT">ETH / USDT</option>
+              <option value="BNBUSDT">BNB / USDT</option>
+              <option value="SOLUSDT">SOL / USDT</option>
+              <option value="XRPUSDT">XRP / USDT</option>
+              <option value="DOGEUSDT">DOGE / USDT</option>
+            </select>
+          </label>
+
+          <section class="card news-summary-card">
+            <header><span>新闻聚合判断</span><small id="newsUpdatedAt">等待刷新</small></header>
+            <div class="news-summary-main">
+              <strong class="news-direction neutral" id="newsDirection">中性</strong>
+              <div><span>可信度</span><b id="newsCredibility">--</b></div>
+              <div><span>方向置信度</span><b id="newsConfidence">--</b></div>
+              <div><span>官方确认</span><b id="newsArticleCount">0 / 0</b></div>
+            </div>
+          </section>
+
+          <div class="section-title strategy-section-title">
+            <div><p class="eyebrow">COMPOSITE SIGNALS</p><h2>组合策略参考</h2></div>
+          </div>
+          <div class="composite-signal-list" id="compositeSignalList">
+            <div class="template-skeleton"></div><div class="template-skeleton"></div>
+          </div>
+
+          <div class="section-title strategy-section-title">
+            <div><p class="eyebrow">LATEST</p><h2>最新新闻</h2></div>
+          </div>
+          <div class="news-list" id="newsList">
+            <div class="empty-state news-empty"><span>⌁</span><strong>正在加载新闻</strong><p>首次加载可能需要数秒</p></div>
+          </div>
+
+          <section class="notice strategy-notice">
+            <span class="notice-icon">!</span>
+            <p><strong>判断边界</strong> “官方确认”只表示出处已确认；系统仍会评估项目自述、不确定表述、证据强度和利多利空方向，任何新闻都不能单独触发交易。</p>
+          </section>
+        </section>
+
+        <section class="page" id="paperPage" data-page="paper">
+          <div class="page-heading paper-heading">
+            <div>
+              <p class="eyebrow">DAILY PAPER PORTFOLIO</p>
+              <h1>策略模拟盘</h1>
+              <p>85%横截面多空＋15%趋势，每天北京时间09:00结算。</p>
+            </div>
+            <span class="paper-status-badge" id="paperStatus">读取中</span>
+          </div>
+
+          <section class="card paper-equity-card">
+            <header>
+              <div><span>当前模拟净值</span><small id="paperUpdatedAt">等待首次结算</small></div>
+              <button class="paper-refresh-button" id="refreshPaper" type="button">刷新</button>
+            </header>
+            <strong id="paperEquity">--</strong>
+            <span class="paper-day-pnl neutral" id="paperDayPnl">当日 --</span>
+            <div class="paper-stat-grid">
+              <div><span>累计盈亏</span><b id="paperTotalPnl">--</b></div>
+              <div><span>最大回撤</span><b id="paperDrawdown">--</b></div>
+              <div><span>模型总敞口</span><b id="paperGross">--</b></div>
+              <div><span>下次报告</span><b id="paperNextReport">--</b></div>
+            </div>
+          </section>
+
+          <div class="section-title strategy-section-title">
+            <div><p class="eyebrow">POSITIONS</p><h2>当前模拟仓位</h2></div>
+          </div>
+          <div class="paper-position-list" id="paperPositionList">
+            <div class="empty-state"><span>◎</span><strong>正在读取模拟仓位</strong><p>首次启动只建立基线，不回填此前收益</p></div>
+          </div>
+
+          <div class="section-title strategy-section-title">
+            <div><p class="eyebrow">REPORTS</p><h2>最近日报</h2></div>
+          </div>
+          <div class="paper-report-list" id="paperReportList">
+            <div class="empty-state"><span>◇</span><strong>暂无日报</strong><p>首个完整盈亏日报将在下一次09:00结算后生成</p></div>
+          </div>
+
+          <section class="notice strategy-notice">
+            <span class="notice-icon">!</span>
+            <p><strong>模拟边界</strong> 该账户只使用公开行情和固定成本模型，不会调用下单接口，也不代表真实成交或未来收益。</p>
           </section>
         </section>
 
@@ -227,8 +325,7 @@
         <button class="active" type="button" data-target="dashboard"><span class="nav-icon">⌁</span><span>行情</span></button>
         <button type="button" data-target="strategies"><span class="nav-icon">▦</span><span>策略</span></button>
         <button type="button" data-target="trade"><span class="nav-icon">⇅</span><span>交易</span></button>
-        <button type="button" data-target="assets"><span class="nav-icon">◇</span><span>资产</span></button>
-        <button type="button" data-target="settings"><span class="nav-icon">⚙</span><span>设置</span></button>
+        <button type="button" data-target="settings"><span class="nav-icon">⚙</span><span>我的</span></button>
       </nav>
     </div>
 
@@ -266,6 +363,6 @@
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="/app.js?v=20260715-okx"></script>
+    <script type="module" src="/app.js?v=20260716-paper-trading"></script>
   </body>
 </html>

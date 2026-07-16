@@ -1,0 +1,12 @@
+{
+  "generatedAt": "2026-07-16T06:11:10.144Z",
+  "source": "https://api.alternative.me/fng/?limit=0&format=json",
+  "attribution": "Data from Alternative.me Crypto Fear & Greed Index",
+  "requestedStartDate": "2022-07-01",
+  "requestedEndDate": "2026-07-15",
+  "firstDate": "2022-07-01",
+  "lastDate": "2026-07-15",
+  "rows": 1475,
+  "file": "fear-greed.csv",
+  "sha256": "ca3aa465383d089692db35c6c0d87c1944891808e2601318a248c95bd6d4fa46"
+}

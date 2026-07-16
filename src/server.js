@@ -4,6 +4,10 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BinanceApiError, BinanceClient, TESTNET_API_BASE } from './binance-client.js';
+import { SignalAccuracyStore } from './accuracy-leverage.js';
+import { calculateCompositeSignal, calculatePriceTrendScore, COMPOSITE_STRATEGY_PROFILES } from './composite-strategies.js';
+import { NewsService } from './news-service.js';
+import { PaperPortfolioStore, paperPortfolioSnapshot } from './monthly-accuracy-paper.js';
 import { STRATEGY_CATALOG, STRATEGY_SYMBOLS, StrategyStore } from './strategies.js';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -13,8 +17,17 @@ const host = process.env.HOST || '127.0.0.1';
 const sessionTtlMs = Number(process.env.SESSION_TTL_MINUTES || 30) * 60_000;
 const apiBase = process.env.BINANCE_API_BASE || TESTNET_API_BASE;
 const strategyStore = new StrategyStore(path.join(rootDir, 'data', 'config', 'strategies.json'));
+const signalAccuracyStore = new SignalAccuracyStore(path.join(rootDir, 'data', 'runtime', 'signal-accuracy.json'));
+const paperPortfolioStore = new PaperPortfolioStore(
+  path.join(rootDir, 'data', 'runtime', 'monthly-accuracy-paper.json'),
+);
+const newsService = new NewsService({
+  cryptoPanicToken: process.env.CRYPTOPANIC_API_TOKEN || '',
+  cryptoPanicPlan: process.env.CRYPTOPANIC_API_PLAN || 'growth',
+});
 const sessions = new Map();
 const requestBuckets = new Map();
+const marketSignalCache = new Map();
 
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
@@ -105,6 +118,63 @@ function validateSymbol(value) {
   return symbol;
 }
 
+function configuredCompositeProfile(profile, strategies) {
+  const configured = strategies.find((strategy) => strategy.enabled && strategy.type === profile.type);
+  if (!configured) return profile;
+  const config = configured.config;
+  const accuracyLeverage = profile.accuracyLeverage && config.accuracyLeverageEnabled !== 'disabled'
+    ? {
+      ...profile.accuracyLeverage,
+      minimumAccuracy: (config.accuracyLeverageThresholdPercent ?? profile.accuracyLeverage.minimumAccuracy * 100) / 100,
+      minimumSamples: config.accuracyLeverageMinimumSamples ?? profile.accuracyLeverage.minimumSamples,
+      performanceWindow: Math.max(
+        profile.accuracyLeverage.performanceWindow,
+        config.accuracyLeverageMinimumSamples ?? profile.accuracyLeverage.minimumSamples,
+      ),
+      minimumRecentAccuracy: (config.accuracyLeverageRecentThresholdPercent
+        ?? profile.accuracyLeverage.minimumRecentAccuracy * 100) / 100,
+      leverageMultiplier: config.accuracyLeverageMultiplier ?? profile.accuracyLeverage.leverageMultiplier,
+      maximumAnnualizedVolatility: (config.accuracyLeverageMaxVolatilityPercent
+        ?? profile.accuracyLeverage.maximumAnnualizedVolatility * 100) / 100,
+      maximumDrawdownMagnitude: (config.accuracyLeverageMaxDrawdownPercent
+        ?? profile.accuracyLeverage.maximumDrawdownMagnitude * 100) / 100,
+    }
+    : null;
+  return {
+    ...profile,
+    name: configured.name,
+    positionMode: config.positionMode,
+    priceSignalWeight: config.priceSignalWeight,
+    newsSignalWeight: config.newsSignalWeight,
+    minimumNewsCredibility: config.minimumNewsCredibility,
+    minimumNewsConfidence: config.minimumNewsConfidence,
+    targetVolatilityPercent: config.targetVolatilityPercent,
+    maxGrossExposurePercent: config.maxGrossExposurePercent,
+    maxAssetExposurePercent: config.maxAssetExposurePercent,
+    portfolioDrawdownLimitPercent: config.portfolioDrawdownLimitPercent,
+    defaultLeverage: config.leverage,
+    accuracyLeverage,
+  };
+}
+
+async function livePriceSignal(symbol) {
+  const cached = marketSignalCache.get(symbol);
+  if (cached && Date.now() - cached.updatedAt < 60_000) return cached.observation;
+  const klines = await clientFor().publicRequest('/api/v3/klines', { symbol, interval: '4h', limit: 180 });
+  const now = Date.now();
+  const closedKlines = klines.filter((item) => Number(item[6]) <= now);
+  const signal = calculatePriceTrendScore(closedKlines);
+  const lastClosed = closedKlines.at(-1);
+  const observation = {
+    signal,
+    referencePrice: Number(lastClosed[4]),
+    observedAt: Number(lastClosed[6]),
+    candles: closedKlines.map((item) => ({ closedAt: Number(item[6]), close: Number(item[4]) })),
+  };
+  marketSignalCache.set(symbol, { updatedAt: now, observation });
+  return observation;
+}
+
 function rateLimited(req) {
   const key = req.socket.remoteAddress || 'unknown';
   const now = Date.now();
@@ -136,6 +206,71 @@ async function apiRoute(req, res, url) {
 
   if (req.method === 'GET' && url.pathname === '/api/strategies') {
     return sendJson(res, 200, { strategies: await strategyStore.list() });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/paper-portfolio') {
+    return sendJson(res, 200, paperPortfolioSnapshot(await paperPortfolioStore.read()));
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/paper-portfolio/reports') {
+    const rawLimit = url.searchParams.get('limit') || '30';
+    if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > 365) {
+      throw Object.assign(new Error('日报数量必须在 1 到 365 之间'), { status: 400 });
+    }
+    const snapshot = paperPortfolioSnapshot(await paperPortfolioStore.read());
+    return sendJson(res, 200, {
+      reports: snapshot.reports.slice(-Number(rawLimit)).reverse(),
+    });
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/news') {
+    return sendJson(res, 200, await newsService.getNews());
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/composite-signals') {
+    const symbol = validateSymbol(url.searchParams.get('symbol') || 'BTCUSDT');
+    if (!STRATEGY_SYMBOLS.some((item) => item.value === symbol)) {
+      throw Object.assign(new Error('组合策略暂不支持该交易对'), { status: 400 });
+    }
+    const [news, marketObservation, storedStrategies] = await Promise.all([
+      newsService.getNews(),
+      livePriceSignal(symbol),
+      strategyStore.list(),
+    ]);
+    const { signal: priceSignal } = marketObservation;
+    const newsSummary = news.summary.bySymbol[symbol];
+    const profiles = Object.values(COMPOSITE_STRATEGY_PROFILES)
+      .map((profile) => configuredCompositeProfile(profile, storedStrategies));
+    const stableProfile = profiles.find((profile) => profile.type === 'stableComposite');
+    const stableSignal = calculateCompositeSignal(stableProfile, priceSignal, newsSummary);
+    const accuracyObservation = await signalAccuracyStore.observe({
+      strategyType: stableProfile.type,
+      symbol,
+      action: stableSignal.action,
+      targetGrossExposurePercent: stableSignal.risk.baseTargetGrossExposurePercent,
+      referencePrice: marketObservation.referencePrice,
+      observedAt: marketObservation.observedAt,
+      candles: marketObservation.candles,
+    }, stableProfile.accuracyLeverage || COMPOSITE_STRATEGY_PROFILES.stableComposite.accuracyLeverage);
+    return sendJson(res, 200, {
+      symbol,
+      updatedAt: new Date().toISOString(),
+      priceSignal,
+      newsSummary,
+      strategies: profiles.map((profile) => (
+        calculateCompositeSignal(
+          profile,
+          priceSignal,
+          newsSummary,
+          profile.type === stableProfile.type ? accuracyObservation.performance : null,
+        )
+      )),
+      accuracyTracking: {
+        horizonHours: COMPOSITE_STRATEGY_PROFILES.stableComposite.accuracyLeverage.horizonHours,
+        recorded: accuracyObservation.recorded,
+        settledCount: accuracyObservation.settledCount,
+      },
+    });
   }
 
   if (req.method === 'POST' && url.pathname === '/api/strategies') {
@@ -255,11 +390,20 @@ async function apiRoute(req, res, url) {
     const order = { symbol, side, type: 'MARKET' };
     if (side === 'BUY') order.quoteOrderQty = amount;
     else order.quantity = amount;
-    await clientFor(session).testOrder(order);
+    const client = clientFor(session);
+    const [ticker] = await Promise.all([
+      client.publicRequest('/api/v3/ticker/24hr', { symbol }),
+      client.testOrder(order),
+    ]);
     return sendJson(res, 200, {
       validated: true,
       message: '测试订单校验通过，未进入撮合，也不会产生真实成交',
       order,
+      execution: {
+        referencePrice: ticker.lastPrice,
+        pnl: null,
+        pnlStatus: 'not_applicable',
+      },
       testedAt: Date.now(),
     });
   }
