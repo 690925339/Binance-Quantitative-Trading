@@ -65,19 +65,35 @@ export function calculatePriceTrendScore(klines) {
   };
 }
 
-export function calculateCompositeSignal(profile, priceSignal, newsSummary, performance = null) {
-  if (!profile || !Number.isFinite(priceSignal?.score)) throw new Error('组合策略价格信号无效');
+export function evaluateNewsGate(profile, newsSummary) {
+  if (!profile) throw new Error('新闻门槛配置无效');
   const qualifiedConfirmedArticleCount = (newsSummary?.confirmedAssessments || []).filter((item) => (
     item.credibility >= profile.minimumNewsCredibility
     && item.confidence >= profile.minimumNewsConfidence
     && item.evidenceStrength !== 'weak'
   )).length;
-  const newsEligible = Boolean(
+  const eligible = Boolean(
     newsSummary?.articleCount
     && newsSummary.credibility >= profile.minimumNewsCredibility
     && newsSummary.confidence >= profile.minimumNewsConfidence
     && qualifiedConfirmedArticleCount >= profile.minimumConfirmedArticles
   );
+  return {
+    eligible,
+    credibility: newsSummary?.credibility || 0,
+    confidence: newsSummary?.confidence || 0,
+    confirmedArticleCount: newsSummary?.confirmedArticleCount || 0,
+    qualifiedConfirmedArticleCount,
+    minimumCredibility: profile.minimumNewsCredibility,
+    minimumConfidence: profile.minimumNewsConfidence,
+    minimumConfirmedArticles: profile.minimumConfirmedArticles,
+  };
+}
+
+export function calculateCompositeSignal(profile, priceSignal, newsSummary, performance = null) {
+  if (!profile || !Number.isFinite(priceSignal?.score)) throw new Error('组合策略价格信号无效');
+  const newsGate = evaluateNewsGate(profile, newsSummary);
+  const newsEligible = newsGate.eligible;
   const priceWeight = newsEligible ? profile.priceSignalWeight / 100 : 1;
   const newsWeight = newsEligible ? profile.newsSignalWeight / 100 : 0;
   const newsScore = newsEligible ? clamp(Number(newsSummary.score) || 0, -1, 1) : 0;
@@ -108,15 +124,7 @@ export function calculateCompositeSignal(profile, priceSignal, newsSummary, perf
       newsPercent: Math.round(newsWeight * 100),
     },
     newsEligible,
-    newsGate: {
-      credibility: newsSummary?.credibility || 0,
-      confidence: newsSummary?.confidence || 0,
-      minimumCredibility: profile.minimumNewsCredibility,
-      minimumConfidence: profile.minimumNewsConfidence,
-      confirmedArticleCount: newsSummary?.confirmedArticleCount || 0,
-      qualifiedConfirmedArticleCount,
-      minimumConfirmedArticles: profile.minimumConfirmedArticles,
-    },
+    newsGate,
     risk: {
       targetVolatilityPercent: profile.targetVolatilityPercent,
       maxGrossExposurePercent: profile.maxGrossExposurePercent,

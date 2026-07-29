@@ -8,6 +8,11 @@ import { SignalAccuracyStore } from './accuracy-leverage.js';
 import { calculateCompositeSignal, calculatePriceTrendScore, COMPOSITE_STRATEGY_PROFILES } from './composite-strategies.js';
 import { NewsService } from './news-service.js';
 import { PaperPortfolioStore, paperPortfolioSnapshot } from './monthly-accuracy-paper.js';
+import {
+  buildPaperStrategyReview,
+  PAPER_SHADOW_PROFILES,
+  paperShadowStatePath,
+} from './paper-strategy-review.js';
 import { STRATEGY_CATALOG, STRATEGY_SYMBOLS, StrategyStore } from './strategies.js';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -21,6 +26,9 @@ const signalAccuracyStore = new SignalAccuracyStore(path.join(rootDir, 'data', '
 const paperPortfolioStore = new PaperPortfolioStore(
   path.join(rootDir, 'data', 'runtime', 'monthly-accuracy-paper.json'),
 );
+const paperShadowStores = PAPER_SHADOW_PROFILES.map((profile) => (
+  new PaperPortfolioStore(paperShadowStatePath(rootDir, profile.id))
+));
 const newsService = new NewsService({
   cryptoPanicToken: process.env.CRYPTOPANIC_API_TOKEN || '',
   cryptoPanicPlan: process.env.CRYPTOPANIC_API_PLAN || 'growth',
@@ -188,6 +196,17 @@ function rateLimited(req) {
   return bucket.count > 120;
 }
 
+async function currentPaperPortfolio() {
+  const [baselineState, ...shadowStates] = await Promise.all([
+    paperPortfolioStore.read(),
+    ...paperShadowStores.map((store) => store.read()),
+  ]);
+  return {
+    ...paperPortfolioSnapshot(baselineState),
+    optimizationReview: buildPaperStrategyReview({ baselineState, shadowStates }),
+  };
+}
+
 async function apiRoute(req, res, url) {
   if (rateLimited(req)) return sendJson(res, 429, { error: '请求过于频繁，请稍后重试' });
 
@@ -209,7 +228,12 @@ async function apiRoute(req, res, url) {
   }
 
   if (req.method === 'GET' && url.pathname === '/api/paper-portfolio') {
-    return sendJson(res, 200, paperPortfolioSnapshot(await paperPortfolioStore.read()));
+    return sendJson(res, 200, await currentPaperPortfolio());
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/paper-portfolio/review') {
+    const paper = await currentPaperPortfolio();
+    return sendJson(res, 200, paper.optimizationReview);
   }
 
   if (req.method === 'GET' && url.pathname === '/api/paper-portfolio/reports') {

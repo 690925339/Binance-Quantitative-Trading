@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { runCrossSectionalBacktest } from '../src/cross-sectional-backtest.js';
+import {
+  calculateCrossSectionalWeights,
+  runCrossSectionalBacktest,
+  shouldSuppressSmallRebalance,
+} from '../src/cross-sectional-backtest.js';
 
 function syntheticSeries() {
   const symbols = ['AAAUSDT', 'BBBUSDT', 'CCCUSDT', 'DDDUSDT'];
@@ -64,6 +68,110 @@ test('横截面价差扩大时动态杠杆不超过配置上限', () => {
   assert.ok(result.metrics.averageGrossExposure > 0.5);
 });
 
+test('自适应横截面在稳定信号中保留集中选择并限制单币权重', () => {
+  const series = syntheticSeries();
+  const symbols = Object.keys(series);
+  const closesBySymbol = Object.fromEntries(symbols.map((symbol) => [
+    symbol,
+    series[symbol].map((item) => item.close),
+  ]));
+  const allocation = calculateCrossSectionalWeights(closesBySymbol, symbols, 60, {
+    lookbackDays: 10,
+    positionsPerSide: 1,
+    mode: 'momentum',
+    baseGrossExposure: 0.5,
+    maxGrossExposure: 1.5,
+    dynamicLeverageEnabled: true,
+    dynamicLeverageMax: 3,
+    dispersionTarget: 0.05,
+    adaptiveBreadthEnabled: true,
+    confirmationLookbackDays: [5, 10, 20],
+    uncertainPositionsPerSide: 2,
+    minimumRankStability: 0.7,
+    minimumSelectionGap: 0,
+    uncertainGrossExposureScale: 0.75,
+    uncertainLeverageCap: 1.5,
+    adaptiveVolatilityWindowDays: 20,
+    maximumAdaptiveMarketVolatility: null,
+    highVolatilityGrossExposureScale: 0.5,
+    maximumSingleAssetExposure: 0.45,
+  });
+  assert.equal(allocation.adaptiveRisk.stable, true);
+  assert.equal(allocation.adaptiveRisk.effectivePositionsPerSide, 1);
+  assert.equal(Object.values(allocation.weights).filter((weight) => weight !== 0).length, 2);
+  assert.ok(Math.max(...Object.values(allocation.weights).map(Math.abs)) <= 0.45);
+});
+
+test('自适应横截面在头尾差距不足时分散持仓并收紧杠杆', () => {
+  const series = syntheticSeries();
+  const symbols = Object.keys(series);
+  const closesBySymbol = Object.fromEntries(symbols.map((symbol) => [
+    symbol,
+    series[symbol].map((item) => item.close),
+  ]));
+  const allocation = calculateCrossSectionalWeights(closesBySymbol, symbols, 60, {
+    lookbackDays: 10,
+    positionsPerSide: 1,
+    mode: 'momentum',
+    baseGrossExposure: 0.5,
+    maxGrossExposure: 1.5,
+    dynamicLeverageEnabled: true,
+    dynamicLeverageMax: 3,
+    dispersionTarget: 0.01,
+    adaptiveBreadthEnabled: true,
+    confirmationLookbackDays: [5, 10, 20],
+    uncertainPositionsPerSide: 2,
+    minimumRankStability: 0.7,
+    minimumSelectionGap: 2,
+    uncertainGrossExposureScale: 0.75,
+    uncertainLeverageCap: 1.25,
+    adaptiveVolatilityWindowDays: 20,
+    maximumAdaptiveMarketVolatility: null,
+    highVolatilityGrossExposureScale: 0.5,
+    maximumSingleAssetExposure: null,
+  });
+  assert.equal(allocation.adaptiveRisk.stable, false);
+  assert.equal(allocation.adaptiveRisk.effectivePositionsPerSide, 2);
+  assert.equal(Object.values(allocation.weights).filter((weight) => weight !== 0).length, 4);
+  assert.ok(allocation.leverage <= 1.25);
+  assert.ok(allocation.adaptiveRisk.grossExposure < allocation.adaptiveRisk.requestedGrossExposure + 1e-12);
+});
+
+test('高可信新闻可以按45%权重改变横截面排名，缺少新闻时保持原排名', () => {
+  const closesBySymbol = {
+    AAAUSDT: [100, 110],
+    BBBUSDT: [100, 106],
+    CCCUSDT: [100, 98],
+    DDDUSDT: [100, 90],
+  };
+  const symbols = Object.keys(closesBySymbol);
+  const settings = {
+    lookbackDays: 1,
+    positionsPerSide: 1,
+    mode: 'momentum',
+    dynamicLeverageEnabled: false,
+    dynamicLeverageMax: 1,
+    dispersionTarget: 0.15,
+    baseGrossExposure: 0.5,
+    maxGrossExposure: 0.5,
+  };
+  const baseline = calculateCrossSectionalWeights(closesBySymbol, symbols, 1, settings);
+  const newsAdjusted = calculateCrossSectionalWeights(
+    closesBySymbol,
+    symbols,
+    1,
+    settings,
+    { newsSignalWeight: 0.45, newsScoresBySymbol: { BBBUSDT: 1 } },
+  );
+  assert.ok(baseline.weights.AAAUSDT > 0);
+  assert.ok(newsAdjusted.weights.BBBUSDT > 0);
+  assert.equal(newsAdjusted.newsAppliedSymbols[0], 'BBBUSDT');
+  assert.deepEqual(
+    calculateCrossSectionalWeights(closesBySymbol, symbols, 1, settings).weights,
+    baseline.weights,
+  );
+});
+
 test('月度盈利锁定会产生空仓日并降低平均敞口', () => {
   const unlocked = runCrossSectionalBacktest(syntheticSeries(), { lookbackDays: 10 });
   const locked = runCrossSectionalBacktest(syntheticSeries(), {
@@ -89,6 +197,19 @@ test('按 UTC 日历锚定调仓日，补充预热历史不会移动后续每周
   for (const date of comparisonDates) {
     assert.ok(Math.abs(original.get(date) - prefixed.get(date)) < 0.00001, date);
   }
+});
+
+test('最低换手门槛会跳过小幅仓位变化并保持月初和显著调仓', () => {
+  const smallChange = {
+    scheduled: true,
+    proposedTurnover: 0.08,
+    minimumRebalanceTurnover: 0.10,
+  };
+  assert.equal(shouldSuppressSmallRebalance(smallChange), true);
+  assert.equal(shouldSuppressSmallRebalance({ ...smallChange, proposedTurnover: 0.12 }), false);
+  assert.equal(shouldSuppressSmallRebalance({ ...smallChange, monthChanged: true }), false);
+  assert.equal(shouldSuppressSmallRebalance({ ...smallChange, needsLockClose: true }), false);
+  assert.equal(shouldSuppressSmallRebalance({ ...smallChange, force: true }), false);
 });
 
 test('恐惧指数只使用前一日值，不会让同日数据倒灌到交易信号', () => {
@@ -150,4 +271,14 @@ test('参考过滤器默认关闭，缺少外部数据不会改变原有结果',
   assert.deepEqual(withUnusedReferences.equityCurve, baseline.equityCurve);
   assert.equal(withUnusedReferences.metrics.averageReferenceScale, 1);
   assert.equal(withUnusedReferences.metrics.referenceFilteredDays, 0);
+});
+
+test('自适应横截面默认关闭时不会改变冻结基准净值', () => {
+  const series = syntheticSeries();
+  const baseline = runCrossSectionalBacktest(series, { lookbackDays: 10 });
+  const explicitlyDisabled = runCrossSectionalBacktest(series, {
+    lookbackDays: 10,
+    adaptiveBreadthEnabled: false,
+  });
+  assert.deepEqual(explicitlyDisabled.equityCurve, baseline.equityCurve);
 });

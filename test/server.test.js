@@ -28,6 +28,8 @@ test('首页可访问且包含移动端视口', async () => {
   assert.match(html, /viewport-fit=cover/);
   assert.match(html, /QuantFlow/);
   assert.match(html, /id="paperPage"/);
+  assert.match(html, /id="paperAttribution"/);
+  assert.match(html, /id="paperCandidateList"/);
 });
 
 test('未连接时私有账户接口返回 401', async () => {
@@ -80,6 +82,11 @@ test('模拟盘接口无需测试网会话且日报数量参数受限', async ()
   assert.equal(response.status, 200);
   assert.equal(payload.mode, 'PAPER');
   assert.equal(payload.strategyType, 'monthlyAccuracyPortfolio');
+  assert.equal(payload.optimizationReview.baseline.frozen, true);
+
+  const review = await fetch(`${origin}/api/paper-portfolio/review`);
+  assert.equal(review.status, 200);
+  assert.equal((await review.json()).promotionMode, 'MANUAL_REVIEW_ONLY');
 
   const invalid = await fetch(`${origin}/api/paper-portfolio/reports?limit=0`);
   assert.equal(invalid.status, 400);

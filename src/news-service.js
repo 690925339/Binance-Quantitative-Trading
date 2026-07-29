@@ -4,6 +4,8 @@ const HOUR_MS = 3_600_000;
 const OFFICIAL_CRYPTO_PATTERN = /\b(?:bitcoin|btc|ethereum|ether|eth|bnb|solana|sol|xrp|ripple|dogecoin|doge|crypto(?:currency| asset)?|digital asset|blockchain|stablecoin|tokeni[sz](?:e|ed|ation)|exchange[- ]traded (?:fund|product)|spot etf)\b/i;
 const UNCERTAINTY_PATTERN = /\?$|\b(?:may|might|could|reportedly|rumor|plans?|expects?|targets?)\b|或将|可能|传闻|计划|预计|目标/i;
 const PROJECT_SELF_INTEREST_PATTERN = /\b(?:partner(?:s|ed|ship)?|adopt(?:s|ed|ion)?|launch(?:es|ed)?|record|milestone|growth|ecosystem|breakthrough)\b|合作|采用|上线|创纪录|里程碑|增长|生态|突破/i;
+const MACRO_RISK_PATTERN = /\b(?:war|armed conflict|missile|sanctions?|tariffs?|recession|sovereign default)\b|战争|武装冲突|导弹|制裁|关税|衰退|主权违约/i;
+const RISK_OFF_SURGE_PATTERN = /\b(?:oil|crude|bond[- ]yield|treasury yields?|dollar|dxy)\b.{0,32}\b(?:surge[sd]?|spike[sd]?|jump(?:s|ed)?|soar(?:s|ed)?)\b/i;
 const SYMBOL_PATTERNS = {
   BTCUSDT: /\b(?:btc|bitcoin)\b/i,
   ETHUSDT: /\b(?:eth|ethereum|ether)\b/i,
@@ -15,7 +17,7 @@ const SYMBOL_PATTERNS = {
 
 const POSITIVE_PATTERNS = [
   /\b(?:approve[sd]?|approval|authoriz(?:e|ed|ation)|adopt(?:s|ed|ion)|launch(?:es|ed)?|partner(?:s|ed|ship)|upgrade[sd]?)\b/gi,
-  /\b(?:record (?:high|inflow)|all[- ]time high|inflows?|surges?|rall(?:y|ies|ied)|breakout|recovery|bullish)\b/gi,
+  /\b(?:record (?:high|inflow)|all[- ]time high|inflows?|rall(?:y|ies|ied)|breakout|recovery|bullish)\b/gi,
   /获批|批准|采用|上线|合作|升级|创下新高|资金流入|上涨|反弹|利多/g,
 ];
 
@@ -23,6 +25,7 @@ const NEGATIVE_PATTERNS = [
   /\b(?:hack(?:ed|s)?|exploit(?:ed|s)?|breach(?:ed)?|ban(?:ned|s)?|lawsuit|sue[sd]?|charges?)\b/gi,
   /\b(?:liquidat(?:e|ed|ion)s?|outages?|bankrupt(?:cy)?|fraud|investigat(?:e|ed|ion)|reject(?:s|ed|ion))\b/gi,
   /\b(?:delist(?:s|ed|ing)|outflows?|sell[- ]?off|crash(?:es|ed)?|bearish)\b/gi,
+  /\b(?:slide[sd]?|slump(?:s|ed)?|drop(?:s|ped)?|fall(?:s|en)?|tumble[sd]?|plunge[sd]?|decline[sd]?|weak(?:en|ens|ened))\b/gi,
   /黑客|漏洞|攻击|被盗|禁止|诉讼|指控|清算|宕机|破产|欺诈|调查|拒绝|下架|资金流出|暴跌|利空/g,
 ];
 
@@ -123,7 +126,9 @@ function symbolsFor(title) {
 
 export function analyzeHeadline(title) {
   const positiveMatches = matchCount(title, POSITIVE_PATTERNS);
-  const negativeMatches = matchCount(title, NEGATIVE_PATTERNS);
+  let negativeMatches = matchCount(title, NEGATIVE_PATTERNS);
+  if (MACRO_RISK_PATTERN.test(title)) negativeMatches += 1;
+  if (RISK_OFF_SURGE_PATTERN.test(title)) negativeMatches += 1;
   const difference = positiveMatches - negativeMatches;
   const sentiment = difference > 0 ? 'bullish' : difference < 0 ? 'bearish' : 'neutral';
   let confidence = difference === 0 ? 42 : clamp(58 + Math.abs(difference) * 9, 58, 94);
@@ -438,7 +443,9 @@ export class NewsService {
       count: result.status === 'fulfilled' ? result.value.items.length : 0,
       error: result.status === 'rejected' ? result.reason.message : null,
     }));
-    const rawItems = settled.flatMap((result) => result.status === 'fulfilled' ? result.value.items : []);
+    const rawItems = settled
+      .flatMap((result) => result.status === 'fulfilled' ? result.value.items : [])
+      .filter((item) => !item.publishedAt || Date.parse(item.publishedAt) <= nowMs);
     const enrichedItems = enrichCredibility(rawItems, nowMs);
     const unique = new Map();
     for (const item of enrichedItems) {

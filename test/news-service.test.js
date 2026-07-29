@@ -14,7 +14,7 @@ test('标题分析识别利多、利空、方向置信度和关联交易对', ()
   const bullish = analyzeHeadline('SEC approves spot Bitcoin ETF as inflows surge');
   assert.equal(bullish.sentiment, 'bullish');
   assert.ok(bullish.confidence >= 70);
-  assert.equal(bullish.positiveMatchCount, 3);
+  assert.equal(bullish.positiveMatchCount, 2);
   assert.match(bullish.directionReason, /利多事件词/);
   assert.deepEqual(bullish.symbols, ['BTCUSDT']);
 
@@ -23,6 +23,13 @@ test('标题分析识别利多、利空、方向置信度和关联交易对', ()
   assert.ok(bearish.sentimentScore < 0);
   assert.equal(bearish.negativeMatchCount, 2);
   assert.deepEqual(bearish.symbols, ['ETHUSDT']);
+});
+
+test('币价下跌和避险资产上冲不会被 surge 误判为利多', () => {
+  const result = analyzeHeadline('Bitcoin slides below $65K as Iran conflict fuels oil and bond-yield surge');
+  assert.equal(result.sentiment, 'bearish');
+  assert.ok(result.sentimentScore < 0);
+  assert.ok(result.negativeMatchCount >= 2);
 });
 
 test('RSS 解析只保留有效标题和 http 链接', () => {
@@ -147,4 +154,19 @@ test('全部新闻源失败时返回不可用状态而不是伪造新闻信号',
   assert.equal(result.status, 'unavailable');
   assert.equal(result.items.length, 0);
   assert.equal(result.summary.bySymbol.BTCUSDT.score, 0);
+});
+
+test('发布时间晚于抓取时点的新闻不会进入当时快照', async () => {
+  const service = new NewsService({
+    feeds: [{ id: 'future', name: 'Future Feed', url: 'https://future.test/rss', baseCredibility: 98, sourceTier: 'official' }],
+    fetchImpl: async () => new Response(rss([{
+      title: 'SEC approves spot Bitcoin ETF',
+      url: 'https://future.test/release',
+      publishedAt: 'Wed, 15 Jul 2026 11:00:00 GMT',
+    }]), { status: 200 }),
+    now: () => NOW,
+  });
+  const result = await service.getNews();
+  assert.equal(result.status, 'unavailable');
+  assert.equal(result.items.length, 0);
 });

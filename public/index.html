@@ -7,7 +7,7 @@
     <meta name="description" content="QuantFlow 币安现货测试网量化交易基础版">
     <title>QuantFlow · 币安量化测试台</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="/styles.css?v=20260716-paper-trading">
+    <link rel="stylesheet" href="/styles.css?v=20260717-paper-review">
   </head>
   <body>
     <div class="app-shell">
@@ -212,6 +212,20 @@
           </section>
 
           <div class="section-title strategy-section-title">
+            <div><p class="eyebrow">REVIEW &amp; CHALLENGERS</p><h2>归因复盘与影子优化</h2></div>
+          </div>
+          <section class="card paper-review-card">
+            <header>
+              <div><strong>基准参数已冻结</strong><span>候选只做前向对比，不会自动替换或加杠杆</span></div>
+              <b id="paperReviewCycle">--</b>
+            </header>
+            <div class="paper-attribution" id="paperAttribution">
+              <div class="empty-state"><span>△</span><strong>等待首个完整日报</strong><p>结算后会拆分币种、子策略与成本贡献</p></div>
+            </div>
+            <div class="paper-candidate-list" id="paperCandidateList"></div>
+          </section>
+
+          <div class="section-title strategy-section-title">
             <div><p class="eyebrow">POSITIONS</p><h2>当前模拟仓位</h2></div>
           </div>
           <div class="paper-position-list" id="paperPositionList">
@@ -363,6 +377,6 @@
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="/app.js?v=20260716-paper-trading"></script>
+    <script type="module" src="/app.js?v=20260717-paper-review"></script>
   </body>
 </html>

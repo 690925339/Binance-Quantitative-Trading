@@ -315,6 +315,16 @@ function beijingTime(value, options = {}) {
   }).format(new Date(value));
 }
 
+function paperCandidateStatus(status) {
+  return {
+    not_started: '尚未启动',
+    collecting: '采样中',
+    reviewable: '可诊断',
+    promotable: '待人工晋级复核',
+    reject: '停止晋级',
+  }[status] || status || '--';
+}
+
 function renderPaperPortfolio(paper) {
   const running = paper.status === 'running';
   $('#paperStatus').textContent = running ? '模拟运行中' : '尚未启动';
@@ -326,6 +336,9 @@ function renderPaperPortfolio(paper) {
     $('#paperDrawdown').textContent = '--';
     $('#paperGross').textContent = '--';
     $('#paperNextReport').textContent = '--';
+    $('#paperReviewCycle').textContent = '--';
+    $('#paperAttribution').innerHTML = '<div class="empty-state"><span>△</span><strong>等待首个完整日报</strong><p>结算后会拆分币种、子策略与成本贡献</p></div>';
+    $('#paperCandidateList').innerHTML = '';
     $('#paperPositionList').innerHTML = '<div class="empty-state"><span>◎</span><strong>模拟盘尚未启动</strong><p>运行每日纸面盘任务后将在这里显示持仓和盈亏</p></div>';
     $('#paperReportList').innerHTML = '<div class="empty-state"><span>◇</span><strong>暂无日报</strong><p>首次启动只建立基线</p></div>';
     return;
@@ -341,6 +354,46 @@ function renderPaperPortfolio(paper) {
   $('#paperDrawdown').textContent = percentFormat(paper.maxDrawdown);
   $('#paperGross').textContent = percentFormat(paper.modelGrossExposure);
   $('#paperNextReport').textContent = beijingTime(paper.nextReportAt);
+
+  const review = paper.optimizationReview;
+  const attribution = review?.latestAttribution;
+  $('#paperReviewCycle').textContent = review?.cycleDate || '--';
+  $('#paperAttribution').innerHTML = attribution ? `
+    <div class="paper-attribution-summary">
+      <div><span>横截面子策略</span><b class="${pnlClass(attribution.marketNeutral?.totalPnl)}">${formatPnl(attribution.marketNeutral?.totalPnl)}</b></div>
+      <div><span>趋势子策略</span><b class="${pnlClass(attribution.trend?.totalPnl)}">${formatPnl(attribution.trend?.totalPnl)}</b></div>
+      <div><span>最大拖累</span><b class="negative">${escapeHtml(attribution.largestDetractor.symbol)} ${formatPnl(attribution.largestDetractor.totalPricePnl)}</b></div>
+      <div><span>最大贡献</span><b class="positive">${escapeHtml(attribution.largestContributor.symbol)} ${formatPnl(attribution.largestContributor.totalPricePnl)}</b></div>
+      <div><span>多空价差变化</span><b class="${pnlClass(attribution.marketNeutralSpreadMove)}">${percentFormat(attribution.marketNeutralSpreadMove)}</b></div>
+      <div><span>成本占绝对盈亏</span><b>${percentFormat(attribution.costShareOfAbsolutePnl)}</b></div>
+    </div>
+    <ul>${attribution.diagnostics.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
+  ` : '<div class="empty-state"><span>△</span><strong>等待首个完整日报</strong><p>首日只建仓，次日开始生成归因</p></div>';
+  $('#paperCandidateList').innerHTML = (review?.candidates || []).map((candidate) => {
+    const metrics = candidate.metrics;
+    const newsOverlay = candidate.profile?.newsOverlay;
+    const newsDecision = candidate.latestNewsDecision;
+    const newsNote = newsOverlay ? `
+      <p class="paper-candidate-news">新闻目标权重 ${escapeHtml(newsOverlay.newsSignalWeight)}% · ${newsDecision
+        ? newsDecision.fallbackToPriceOnly
+          ? `当前退回价格信号：${escapeHtml(newsDecision.fallbackReason)}`
+          : `当前应用于 ${escapeHtml(newsDecision.eligibleSymbols.map((item) => item.symbol).join('、'))}`
+        : '等待首个09:00新闻快照'}</p>
+    ` : '';
+    return `
+      <article class="paper-candidate-card ${escapeHtml(candidate.status)}">
+        <header><div><strong>${escapeHtml(candidate.name)}</strong><span>${escapeHtml(candidate.hypothesis)}</span></div><b>${escapeHtml(paperCandidateStatus(candidate.status))}</b></header>
+        <div class="paper-candidate-metrics">
+          <span>共同样本 <strong>${metrics?.observations || 0} / 90天</strong></span>
+          <span>完整月份 <strong>${metrics?.fullMonthCount || 0} / 3</strong></span>
+          <span>相对基准 <strong class="${pnlClass(metrics?.pairedExcessReturn)}">${metrics?.pairedExcessReturn !== null && metrics?.pairedExcessReturn !== undefined ? percentFormat(metrics.pairedExcessReturn) : '--'}</strong></span>
+          <span>最大回撤 <strong>${metrics ? percentFormat(metrics.maxDrawdown) : '--'}</strong></span>
+        </div>
+        ${newsNote}
+        <p>${escapeHtml(candidate.statusReason)}</p>
+      </article>
+    `;
+  }).join('') || '<div class="empty-state"><span>◇</span><strong>影子候选尚未建立</strong><p>每日任务会自动创建并持续观察</p></div>';
 
   $('#paperPositionList').innerHTML = paper.positions.length ? paper.positions.map((position) => `
     <article class="card paper-position-card ${position.side.toLowerCase()}">

@@ -1,4 +1,6 @@
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -7,13 +9,49 @@ import {
   fetchPaperMarketData,
   initializePaperState,
   latestCompletePaperCycleDate,
+  MONTHLY_ACCURACY_PAPER_PROFILE,
   PaperPortfolioStore,
   paperPortfolioSnapshot,
   writePaperReportArtifacts,
 } from '../src/monthly-accuracy-paper.js';
+import { NewsService } from '../src/news-service.js';
+import {
+  buildPaperStrategyReview,
+  PAPER_SHADOW_PROFILES,
+  paperShadowStatePath,
+  writePaperReviewArtifacts,
+} from '../src/paper-strategy-review.js';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const stateFile = path.join(rootDir, 'data', 'runtime', 'monthly-accuracy-paper.json');
+const paperNewsDir = path.join(rootDir, 'data', 'runtime', 'paper-news-snapshots');
+
+function paperNewsSnapshotPath(cycleDate) {
+  return path.join(paperNewsDir, `${cycleDate}.json`);
+}
+
+async function readPaperNewsSnapshot(cycleDate) {
+  return fs.readFile(paperNewsSnapshotPath(cycleDate), 'utf8')
+    .then((text) => JSON.parse(text))
+    .catch((error) => {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    });
+}
+
+async function writePaperNewsSnapshot(cycleDate, news) {
+  await fs.mkdir(paperNewsDir, { recursive: true });
+  const target = paperNewsSnapshotPath(cycleDate);
+  const temporary = `${target}.${crypto.randomUUID()}.tmp`;
+  const snapshot = {
+    ...news,
+    paperCycleDate: cycleDate,
+    capturedForDecisionAt: news.updatedAt,
+  };
+  await fs.writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
+  await fs.rename(temporary, target);
+  return snapshot;
+}
 
 function parseArgs(argv) {
   const args = {};
@@ -37,8 +75,12 @@ function signed(value, digits = 2) {
   return `${number > 0 ? '+' : ''}${number.toFixed(digits)}`;
 }
 
-function reportText(state) {
+function reportText(state, review) {
   const report = state.latestReport;
+  const attribution = review?.latestAttribution;
+  const candidateSummary = (review?.candidates || [])
+    .map((candidate) => `${candidate.name} ${candidate.status} ${candidate.metrics?.observations || 0}天`)
+    .join('；');
   const lines = [
     report.kind === 'initialization'
       ? `模拟盘已于 ${report.cycleDate} 建立基线`
@@ -51,6 +93,11 @@ function reportText(state) {
     `持仓：${state.positions.length
       ? state.positions.map((item) => `${item.symbol} ${item.side === 'LONG' ? '多' : '空'} ${Math.abs(item.weightPercent).toFixed(2)}%`).join('；')
       : '空仓'}`,
+    ...(attribution ? [
+      `复盘：横截面 ${signed(attribution.marketNeutral?.totalPnl)} USDT；趋势 ${signed(attribution.trend?.totalPnl)} USDT`,
+      `最大拖累：${attribution.largestDetractor.symbol} ${signed(attribution.largestDetractor.totalPricePnl)} USDT`,
+    ] : []),
+    ...(candidateSummary ? [`影子策略：${candidateSummary}`] : []),
   ];
   return lines.join('\n');
 }
@@ -77,32 +124,90 @@ export async function runPaperDaily({
   now = Date.now(),
   initialCapital = 10_000,
   fetchImpl = fetch,
+  newsFetchImpl = fetch,
+  newsService = null,
   baseUrl,
   notify = false,
 } = {}) {
   const latestCycleDate = latestCompletePaperCycleDate(now);
-  const store = new PaperPortfolioStore(stateFile);
-  const state = await store.run(async (current) => {
-    if (current && latestCycleDate <= current.lastCycleDate) return current;
-    const startCycleDate = current?.startCycleDate || latestCycleDate;
-    const markStartCycleDate = current
-      ? addUtcDays(current.lastCycleDate, 1)
-      : latestCycleDate;
-    const marketData = await fetchPaperMarketData({
-      historyStartDate: addUtcDays(startCycleDate, -220),
+  const profiles = [MONTHLY_ACCURACY_PAPER_PROFILE, ...PAPER_SHADOW_PROFILES];
+  const stores = [
+    new PaperPortfolioStore(stateFile),
+    ...PAPER_SHADOW_PROFILES.map((profile) => (
+      new PaperPortfolioStore(paperShadowStatePath(rootDir, profile.id))
+    )),
+  ];
+  const existingStates = await Promise.all(stores.map((store) => store.read()));
+  const pendingIndexes = existingStates
+    .map((current, index) => ({ current, index }))
+    .filter(({ current }) => !current || current.lastCycleDate < latestCycleDate);
+  const newsSnapshotsByCycleDate = {};
+  const pendingNewsIndexes = pendingIndexes.filter(({ index }) => (
+    profiles[index]?.newsOverlay?.enabled
+  ));
+  if (pendingNewsIndexes.length) {
+    for (const { current } of pendingNewsIndexes) {
+      let cycleDate = current ? addUtcDays(current.lastCycleDate, 1) : latestCycleDate;
+      while (cycleDate < latestCycleDate) {
+        const stored = await readPaperNewsSnapshot(cycleDate);
+        if (stored) newsSnapshotsByCycleDate[cycleDate] = stored;
+        cycleDate = addUtcDays(cycleDate, 1);
+      }
+    }
+    let latestNews = await readPaperNewsSnapshot(latestCycleDate);
+    const scheduledDecisionAt = Date.parse(`${latestCycleDate}T01:00:00.000Z`);
+    const timelyCapture = Number(now) >= scheduledDecisionAt
+      && Number(now) <= scheduledDecisionAt + 15 * 60_000;
+    if (!latestNews && timelyCapture) {
+      const activeNewsService = newsService || new NewsService({
+        fetchImpl: newsFetchImpl,
+        now: () => Number(now),
+        cryptoPanicToken: process.env.CRYPTOPANIC_API_TOKEN || '',
+        cryptoPanicPlan: process.env.CRYPTOPANIC_API_PLAN || 'growth',
+      });
+      latestNews = await activeNewsService.getNews();
+      latestNews = await writePaperNewsSnapshot(latestCycleDate, latestNews);
+    }
+    if (latestNews) newsSnapshotsByCycleDate[latestCycleDate] = latestNews;
+  }
+  let marketData = null;
+  if (pendingIndexes.length) {
+    const historyStartCycleDate = pendingIndexes
+      .map(({ current }) => current?.startCycleDate || latestCycleDate)
+      .sort()[0];
+    const markStartCycleDate = pendingIndexes
+      .map(({ current }) => current ? addUtcDays(current.lastCycleDate, 1) : latestCycleDate)
+      .sort()[0];
+    marketData = await fetchPaperMarketData({
+      historyStartDate: addUtcDays(historyStartCycleDate, -220),
       signalEndDate: addUtcDays(latestCycleDate, -1),
       markStartCycleDate,
       markEndCycleDate: latestCycleDate,
       fetchImpl,
       ...(baseUrl ? { baseUrl } : {}),
     });
+  }
+  const states = await Promise.all(stores.map((store, index) => store.run((current) => {
+    const profile = current?.profileSnapshot || profiles[index];
+    if (current && !current.profileSnapshot) {
+      current.profileSnapshot = JSON.parse(JSON.stringify(profile));
+    }
+    if (current && latestCycleDate <= current.lastCycleDate) return current;
+    if (!marketData) throw new Error('模拟盘缺少待结算行情');
     if (!current) {
+      if (profile.newsOverlay?.enabled && !newsSnapshotsByCycleDate[latestCycleDate]) {
+        return current;
+      }
       return initializePaperState({
         seriesBySymbol: marketData.seriesBySymbol,
         cycleDate: latestCycleDate,
         markPrices: marketData.markPricesByCycleDate[latestCycleDate],
         initialCapital,
         now,
+        profile,
+        newsSnapshot: profile.newsOverlay?.enabled
+          ? newsSnapshotsByCycleDate[latestCycleDate] || null
+          : null,
       });
     }
     return advancePaperState({
@@ -111,13 +216,20 @@ export async function runPaperDaily({
       markPricesByCycleDate: marketData.markPricesByCycleDate,
       throughCycleDate: latestCycleDate,
       now,
+      profile,
+      newsSnapshotsByCycleDate: profile.newsOverlay?.enabled
+        ? newsSnapshotsByCycleDate
+        : {},
     });
-  });
+  })));
+  const [state, ...shadowStates] = states;
   await writePaperReportArtifacts(rootDir, state);
-  const text = reportText(state);
+  const review = buildPaperStrategyReview({ baselineState: state, shadowStates, now });
+  await writePaperReviewArtifacts(rootDir, review);
+  const text = reportText(state, review);
   console.log(text);
   if (notify) notifyWindows(text);
-  return paperPortfolioSnapshot(state);
+  return { ...paperPortfolioSnapshot(state), optimizationReview: review };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

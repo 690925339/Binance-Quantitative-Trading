@@ -11,6 +11,7 @@ import {
   PaperPortfolioStore,
   paperPortfolioSnapshot,
 } from '../src/monthly-accuracy-paper.js';
+import { PAPER_SHADOW_PROFILES } from '../src/paper-strategy-review.js';
 
 const symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT'];
 
@@ -82,6 +83,16 @@ test('每日推进只结算未处理日期，重复执行保持幂等', () => {
   assert.equal(state.lastCycleDate, '2026-07-17');
   assert.equal(state.latestReport.kind, 'daily');
   assert.ok(Number.isFinite(state.latestReport.dayPnl));
+  assert.equal(
+    Number(state.latestReport.symbolAttribution
+      .reduce((sum, item) => sum + item.totalPricePnl, 0).toFixed(3)),
+    Number(state.latestReport.pricePnl.toFixed(3)),
+  );
+  assert.equal(
+    Number((state.latestReport.componentAttribution.marketNeutral.totalPnl
+      + state.latestReport.componentAttribution.trend.totalPnl).toFixed(3)),
+    Number(state.latestReport.dayPnl.toFixed(3)),
+  );
   assert.equal(reportsAfterFirstRun, 2);
 
   advancePaperState({
@@ -106,13 +117,155 @@ test('北京时间09点之后才使用当天固定估值周期', () => {
   );
 });
 
+test('分散影子使用独立冻结参数并持有每侧两个横截面标的', () => {
+  const series = syntheticSeries('2025-11-01', '2026-07-16');
+  const profile = PAPER_SHADOW_PROFILES.find((item) => item.id.includes('diversified'));
+  const state = initializePaperState({
+    seriesBySymbol: series,
+    cycleDate: '2026-07-16',
+    markPrices: markPrices(series, '2026-07-15', 1.001),
+    initialCapital: 10_000,
+    now: Date.parse('2026-07-16T01:05:00.000Z'),
+    profile,
+  });
+  assert.equal(state.strategyProfileId, profile.id);
+  assert.equal(state.profileSnapshot.marketNeutral.positionsPerSide, 2);
+  assert.equal(
+    state.positions.filter((position) => position.marketNeutralWeight !== 0).length,
+    4,
+  );
+});
+
+test('新闻增强影子只在可信新闻达标时应用45%权重并记录决策', () => {
+  const series = syntheticSeries('2025-11-01', '2026-07-16');
+  const profile = PAPER_SHADOW_PROFILES.find((item) => item.id === 'shadow-news-45-v1');
+  const emptySummary = {
+    score: 0,
+    direction: 'neutral',
+    credibility: 0,
+    confidence: 0,
+    articleCount: 0,
+    confirmedArticleCount: 0,
+    confirmedAssessments: [],
+  };
+  const newsSnapshot = {
+    status: 'live',
+    updatedAt: '2026-07-16T01:00:00.000Z',
+    sourceStatus: [{ source: 'Official', ok: true }],
+    summary: {
+      bySymbol: Object.fromEntries(symbols.map((symbol) => [symbol, symbol === 'ETHUSDT' ? {
+        score: 1,
+        direction: 'bullish',
+        credibility: 92,
+        confidence: 85,
+        articleCount: 1,
+        confirmedArticleCount: 1,
+        confirmedAssessments: [{ credibility: 92, confidence: 85, evidenceStrength: 'strong' }],
+      } : emptySummary])),
+    },
+  };
+  const state = initializePaperState({
+    seriesBySymbol: series,
+    cycleDate: '2026-07-16',
+    markPrices: markPrices(series, '2026-07-15', 1.001),
+    initialCapital: 10_000,
+    now: Date.parse('2026-07-16T01:05:00.000Z'),
+    profile,
+    newsSnapshot,
+  });
+  assert.equal(state.latestReport.nextNewsOverlay.appliedNewsWeightPercent, 45);
+  assert.equal(state.latestReport.nextNewsOverlay.fallbackToPriceOnly, false);
+  const ethRanking = state.latestReport.nextNewsOverlay.ranking
+    .find((item) => item.symbol === 'ETHUSDT');
+  assert.equal(ethRanking.newsEligible, true);
+  assert.equal(ethRanking.newsScore, 1);
+  assert.ok(state.latestReport.nextNewsOverlay.selectedLongSymbols.length > 0);
+});
+
+test('新闻质量影子根据可信度、置信度和方向强度降低边界消息权重', () => {
+  const series = syntheticSeries('2025-11-01', '2026-07-16');
+  const profile = PAPER_SHADOW_PROFILES.find((item) => item.id === 'shadow-news-adaptive-v1');
+  const emptySummary = {
+    score: 0,
+    direction: 'neutral',
+    credibility: 0,
+    confidence: 0,
+    articleCount: 0,
+    confirmedArticleCount: 0,
+    confirmedAssessments: [],
+  };
+  const newsSnapshot = {
+    status: 'live',
+    updatedAt: '2026-07-16T01:00:00.000Z',
+    sourceStatus: [{ source: 'Official', ok: true }],
+    summary: {
+      bySymbol: Object.fromEntries(symbols.map((symbol) => [symbol, symbol === 'ETHUSDT' ? {
+        score: 0.20,
+        direction: 'bullish',
+        credibility: 80,
+        confidence: 70,
+        articleCount: 1,
+        confirmedArticleCount: 1,
+        confirmedAssessments: [{ credibility: 80, confidence: 70, evidenceStrength: 'strong' }],
+      } : emptySummary])),
+    },
+  };
+  const state = initializePaperState({
+    seriesBySymbol: series,
+    cycleDate: '2026-07-16',
+    markPrices: markPrices(series, '2026-07-15', 1.001),
+    initialCapital: 10_000,
+    now: Date.parse('2026-07-16T01:05:00.000Z'),
+    profile,
+    newsSnapshot,
+  });
+  const decision = state.latestReport.nextNewsOverlay;
+  const ethRanking = decision.ranking.find((item) => item.symbol === 'ETHUSDT');
+  assert.equal(decision.newsWeightMode, 'quality');
+  assert.equal(decision.appliedNewsWeightPercent, 10.08);
+  assert.equal(ethRanking.newsWeightPercent, 10.08);
+  assert.ok(decision.appliedNewsWeightPercent > 0);
+  assert.ok(decision.appliedNewsWeightPercent < decision.requestedNewsWeightPercent);
+});
+
+test('新闻增强影子在新闻不可用时回退为原价格排名', () => {
+  const series = syntheticSeries('2025-11-01', '2026-07-16');
+  const profile = PAPER_SHADOW_PROFILES.find((item) => item.id === 'shadow-news-45-v1');
+  const baseline = initializePaperState({
+    seriesBySymbol: series,
+    cycleDate: '2026-07-16',
+    markPrices: markPrices(series, '2026-07-15', 1.001),
+    initialCapital: 10_000,
+    now: Date.parse('2026-07-16T01:05:00.000Z'),
+  });
+  const fallback = initializePaperState({
+    seriesBySymbol: series,
+    cycleDate: '2026-07-16',
+    markPrices: markPrices(series, '2026-07-15', 1.001),
+    initialCapital: 10_000,
+    now: Date.parse('2026-07-16T01:05:00.000Z'),
+    profile,
+    newsSnapshot: { status: 'unavailable', updatedAt: '2026-07-16T01:00:00.000Z' },
+  });
+  assert.equal(fallback.latestReport.nextNewsOverlay.appliedNewsWeightPercent, 0);
+  assert.equal(fallback.latestReport.nextNewsOverlay.fallbackToPriceOnly, true);
+  assert.deepEqual(
+    fallback.positions.map((item) => [item.symbol, Math.sign(item.weight)]),
+    baseline.positions.map((item) => [item.symbol, Math.sign(item.weight)]),
+  );
+});
+
 test('纸面盘状态使用锁文件和原子写入持久化', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'quantflow-paper-'));
   const filePath = path.join(directory, 'paper.json');
   const store = new PaperPortfolioStore(filePath);
   await store.run((current) => ({ version: 1, count: (current?.count || 0) + 1 }));
   await store.run((current) => ({ ...current, count: current.count + 1 }));
-  assert.deepEqual(await store.read(), { version: 1, count: 2 });
+  await store.run((current) => {
+    current.count += 1;
+    return current;
+  });
+  assert.deepEqual(await store.read(), { version: 1, count: 3 });
   assert.equal(await fs.stat(`${filePath}.lock`).catch(() => null), null);
   await fs.rm(directory, { recursive: true, force: true });
 });

@@ -4,7 +4,9 @@ import path from 'node:path';
 import {
   calculateCrossSectionalWeights,
   isCalendarRebalanceDay,
+  shouldSuppressSmallRebalance,
 } from './cross-sectional-backtest.js';
+import { evaluateNewsGate } from './composite-strategies.js';
 import { calculateLongShortTrendWeights } from './long-short-trend.js';
 
 const DAY_MS = 86_400_000;
@@ -37,6 +39,7 @@ export const MONTHLY_ACCURACY_PAPER_PROFILE = Object.freeze({
     dynamicLeverageEnabled: true,
     dynamicLeverageMax: 3,
     dispersionTarget: 0.15,
+    minimumRebalanceTurnover: 0,
     tradingCostRate: 0.0007,
     dailyCarryCostRate: 0.00005,
     monthlyProfitLock: 0.01,
@@ -68,12 +71,20 @@ function round(value, digits = 8) {
   return Number(Number(value).toFixed(digits));
 }
 
+function mean(values) {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+}
+
 function zeroWeights(symbols = PAPER_SYMBOLS) {
   return Object.fromEntries(symbols.map((symbol) => [symbol, 0]));
 }
 
 function sumAbsolute(weights) {
   return Object.values(weights).reduce((sum, value) => sum + Math.abs(Number(value) || 0), 0);
+}
+
+function profileSnapshot(profile) {
+  return JSON.parse(JSON.stringify(profile));
 }
 
 function turnover(previousWeights, nextWeights, symbols = PAPER_SYMBOLS) {
@@ -140,6 +151,93 @@ function normalizeDailyMarket(seriesBySymbol, symbols = PAPER_SYMBOLS) {
   };
 }
 
+export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
+  const settings = profile?.newsOverlay;
+  if (!settings?.enabled) return { signalContext: {}, decision: null };
+  const live = newsSnapshot?.status === 'live';
+  const newsWeightMode = settings.newsWeightMode || 'fixed';
+  const configuredDirectionStrength = Number(settings.directionStrengthFullWeight);
+  const directionStrengthFullWeight = Number.isFinite(configuredDirectionStrength)
+    && configuredDirectionStrength > 0
+    ? configuredDirectionStrength
+    : 0.5;
+  const evaluated = symbols.map((symbol) => {
+    const summary = newsSnapshot?.summary?.bySymbol?.[symbol] || null;
+    const gate = evaluateNewsGate(settings, summary);
+    const score = Number(summary?.score || 0);
+    const eligible = live
+      && gate.eligible
+      && Number.isFinite(score)
+      && Math.abs(score) >= settings.minimumAbsoluteScore;
+    const qualityMultiplier = eligible && newsWeightMode === 'quality'
+      ? Math.min(1, Math.max(0, Number(summary?.credibility || 0) / 100))
+        * Math.min(1, Math.max(0, Number(summary?.confidence || 0) / 100))
+        * Math.min(1, Math.abs(score) / directionStrengthFullWeight)
+      : eligible ? 1 : 0;
+    const appliedNewsWeightPercent = round(settings.newsSignalWeight * qualityMultiplier, 2);
+    return {
+      symbol,
+      score: round(score, 4),
+      eligible,
+      gate,
+      direction: summary?.direction || 'neutral',
+      articleCount: summary?.articleCount || 0,
+      credibility: Number(summary?.credibility || 0),
+      confidence: Number(summary?.confidence || 0),
+      qualityMultiplier: round(qualityMultiplier, 4),
+      appliedNewsWeightPercent,
+    };
+  });
+  const eligible = evaluated.filter((item) => item.eligible);
+  const newsScoresBySymbol = Object.fromEntries(eligible.map((item) => [item.symbol, item.score]));
+  const newsWeightsBySymbol = Object.fromEntries(eligible.map((item) => [
+    item.symbol,
+    item.appliedNewsWeightPercent / 100,
+  ]));
+  const sourceStatus = newsSnapshot?.sourceStatus || [];
+  const fingerprint = eligible.length
+    ? JSON.stringify(eligible.map((item) => [
+      item.symbol,
+      item.score,
+      item.appliedNewsWeightPercent,
+    ]))
+    : `price-only:${newsSnapshot?.status || 'missing'}`;
+  const appliedWeights = eligible.map((item) => item.appliedNewsWeightPercent);
+  return {
+    signalContext: {
+      newsSignalWeight: eligible.length && newsWeightMode === 'fixed'
+        ? settings.newsSignalWeight / 100
+        : 0,
+      newsScoresBySymbol,
+      newsWeightsBySymbol: newsWeightMode === 'quality' ? newsWeightsBySymbol : {},
+    },
+    decision: {
+      enabled: true,
+      newsWeightMode,
+      status: newsSnapshot?.status || 'missing',
+      capturedAt: newsSnapshot?.updatedAt || null,
+      requestedNewsWeightPercent: settings.newsSignalWeight,
+      appliedNewsWeightPercent: appliedWeights.length ? round(Math.max(...appliedWeights), 2) : 0,
+      averageAppliedNewsWeightPercent: appliedWeights.length
+        ? round(mean(appliedWeights), 2)
+        : 0,
+      fallbackToPriceOnly: eligible.length === 0,
+      fallbackReason: !live
+        ? '新闻快照不可用或不是实时状态'
+        : eligible.length
+          ? null
+          : '没有同时通过可信度、方向置信度、官方确认和方向强度门槛的消息',
+      eligibleSymbols: eligible,
+      evaluatedSymbols: evaluated,
+      sourceAvailability: {
+        available: sourceStatus.filter((item) => item.ok).length,
+        total: sourceStatus.length,
+      },
+      fingerprint,
+    },
+  };
+}
+
 function marketReturn(weights, previousPrices, currentPrices, symbols = PAPER_SYMBOLS) {
   return symbols.reduce((sum, symbol) => (
     sum + (weights[symbol] || 0) * (currentPrices[symbol] / previousPrices[symbol] - 1)
@@ -174,39 +272,111 @@ function prepareMarketNeutral({
   market,
   signalDate,
   upcomingResultDate,
+  profile,
   force = false,
+  newsSnapshot = null,
 }) {
-  const settings = MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutral;
+  const settings = profile.marketNeutral;
   const signalIndex = market.dateIndex.get(signalDate);
-  if (!Number.isInteger(signalIndex) || signalIndex < settings.lookbackDays) {
+  const warmupDays = Math.max(
+    settings.lookbackDays,
+    ...(settings.adaptiveBreadthEnabled ? settings.confirmationLookbackDays : []),
+    settings.adaptiveBreadthEnabled ? settings.adaptiveVolatilityWindowDays : 0,
+  );
+  if (!Number.isInteger(signalIndex) || signalIndex < warmupDays) {
     throw new Error(`${signalDate} 横截面信号预热不足`);
   }
   const monthChanged = resetMonthIfNeeded(component, upcomingResultDate);
   const scheduled = isCalendarRebalanceDay(signalDate, settings.rebalanceDays);
-  if (component.lockReason === null && (force || monthChanged || scheduled)) {
-    const allocation = calculateCrossSectionalWeights(
+  const news = buildPaperNewsSignalContext(newsSnapshot, market.symbols, profile);
+  const newsDecisionChanged = Boolean(
+    news.decision
+    && component.lastNewsDecision?.fingerprint !== news.decision.fingerprint
+  );
+  let proposedBaseWeights = component.baseWeights;
+  let proposedLeverage = component.dynamicLeverage;
+  let allocation = null;
+  if (component.lockReason === null
+    && (force || monthChanged || scheduled || newsDecisionChanged)) {
+    allocation = calculateCrossSectionalWeights(
       market.closesBySymbol,
       market.symbols,
       signalIndex,
       settings,
+      news.signalContext,
     );
-    component.baseWeights = allocation.weights;
-    component.dynamicLeverage = allocation.leverage;
+    proposedBaseWeights = allocation.weights;
+    proposedLeverage = allocation.leverage;
   }
-  const nextWeights = component.lockReason === null
-    ? { ...component.baseWeights }
+  const proposedWeights = component.lockReason === null
+    ? { ...proposedBaseWeights }
     : zeroWeights(market.symbols);
+  const proposedTurnover = turnover(component.weights, proposedWeights, market.symbols);
+  const suppressed = shouldSuppressSmallRebalance({
+    scheduled,
+    force,
+    monthChanged,
+    referenceScaleChanged: newsDecisionChanged,
+    proposedTurnover,
+    minimumRebalanceTurnover: settings.minimumRebalanceTurnover || 0,
+  });
+  const nextWeights = suppressed ? component.weights : proposedWeights;
   const changed = force
     || monthChanged
-    || scheduled
+    || newsDecisionChanged
+    || (scheduled && !suppressed)
     || turnover(component.weights, nextWeights, market.symbols) > 0;
   const nextTurnover = changed ? turnover(component.weights, nextWeights, market.symbols) : 0;
+  if (!suppressed && component.lockReason === null) {
+    component.baseWeights = proposedBaseWeights;
+    component.dynamicLeverage = proposedLeverage;
+    if (allocation?.adaptiveRisk) {
+      component.lastAdaptiveRisk = {
+        ...allocation.adaptiveRisk,
+        rankStability: round(allocation.adaptiveRisk.rankStability, 4),
+        selectionGap: allocation.adaptiveRisk.selectionGap === null
+          ? null
+          : round(allocation.adaptiveRisk.selectionGap, 4),
+        marketVolatility: allocation.adaptiveRisk.marketVolatility === null
+          ? null
+          : round(allocation.adaptiveRisk.marketVolatility, 4),
+        requestedGrossExposure: round(allocation.adaptiveRisk.requestedGrossExposure, 4),
+        grossExposure: round(allocation.adaptiveRisk.grossExposure, 4),
+        maximumSingleAssetExposure: round(
+          allocation.adaptiveRisk.maximumSingleAssetExposure,
+          4,
+        ),
+      };
+    }
+  }
   component.weights = nextWeights;
+  if (news.decision) {
+    component.lastNewsDecision = {
+      ...news.decision,
+      selectedLongSymbols: Object.entries(nextWeights)
+        .filter(([, weight]) => weight > 0)
+        .map(([symbol]) => symbol),
+      selectedShortSymbols: Object.entries(nextWeights)
+        .filter(([, weight]) => weight < 0)
+        .map(([symbol]) => symbol),
+      ranking: allocation?.ranking?.map((item) => ({
+        symbol: item.symbol,
+        priceScore: round(item.priceScore, 4),
+        newsScore: round(item.newsScore, 4),
+        newsWeightPercent: round((item.newsWeight || 0) * 100, 2),
+        newsEligible: item.newsEligible,
+        rankingScore: round(item.rankingScore, 4),
+      })) || null,
+    };
+  }
   return {
     turnover: nextTurnover,
     scheduled,
+    suppressed,
     monthChanged,
     dynamicLeverage: component.dynamicLeverage,
+    newsDecision: component.lastNewsDecision || null,
+    adaptiveRisk: component.lastAdaptiveRisk || null,
   };
 }
 
@@ -215,8 +385,9 @@ function prepareTrend({
   market,
   signalDate,
   upcomingResultDate,
+  profile,
 }) {
-  const settings = MONTHLY_ACCURACY_PAPER_PROFILE.trend;
+  const settings = profile.trend;
   const signalIndex = market.dateIndex.get(signalDate);
   const warmup = Math.max(...settings.lookbackDays, settings.volatilityWindowDays);
   if (!Number.isInteger(signalIndex) || signalIndex < warmup) {
@@ -249,8 +420,7 @@ function prepareTrend({
   };
 }
 
-function currentPositions(state, prices) {
-  const profile = MONTHLY_ACCURACY_PAPER_PROFILE;
+function currentPositions(state, prices, profile) {
   const positions = PAPER_SYMBOLS.map((symbol) => {
     const marketNeutralWeight = profile.marketNeutralWeight
       * (state.components.marketNeutral.weights[symbol] || 0);
@@ -310,6 +480,8 @@ function reportSummary(state, report) {
         ),
         lockReason: state.components.marketNeutral.lockReason,
         dynamicLeverage: state.components.marketNeutral.dynamicLeverage,
+        newsOverlay: state.components.marketNeutral.lastNewsDecision || null,
+        adaptiveRisk: state.components.marketNeutral.lastAdaptiveRisk || null,
       },
       trend: {
         currentMonth: state.components.trend.currentMonth,
@@ -329,6 +501,8 @@ export function initializePaperState({
   markPrices,
   initialCapital = 10_000,
   now = Date.now(),
+  profile = MONTHLY_ACCURACY_PAPER_PROFILE,
+  newsSnapshot = null,
 }) {
   if (!Number.isFinite(initialCapital) || initialCapital <= 0) {
     throw new Error('模拟盘初始资金必须大于 0');
@@ -342,8 +516,9 @@ export function initializePaperState({
     mode: 'PAPER',
     status: 'running',
     strategyType: 'monthlyAccuracyPortfolio',
-    strategyName: MONTHLY_ACCURACY_PAPER_PROFILE.name,
-    strategyProfileId: MONTHLY_ACCURACY_PAPER_PROFILE.id,
+    strategyName: profile.name,
+    strategyProfileId: profile.id,
+    profileSnapshot: profileSnapshot(profile),
     timezone: 'Asia/Shanghai',
     schedule: '09:00',
     startedAt: new Date(now).toISOString(),
@@ -366,6 +541,8 @@ export function initializePaperState({
         baseWeights: zeroWeights(),
         weights: zeroWeights(),
         dynamicLeverage: 1,
+        lastNewsDecision: null,
+        lastAdaptiveRisk: null,
       },
       trend: {
         equity: 1,
@@ -387,30 +564,34 @@ export function initializePaperState({
     market,
     signalDate,
     upcomingResultDate,
+    profile,
     force: true,
+    newsSnapshot,
   });
   const trendTrade = prepareTrend({
     component: state.components.trend,
     market,
     signalDate,
     upcomingResultDate,
+    profile,
   });
   const marketNeutralTradingReturn = -marketNeutralTrade.turnover
-    * MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutral.tradingCostRate;
+    * profile.marketNeutral.tradingCostRate;
   const trendTradingReturn = -trendTrade.turnover
-    * MONTHLY_ACCURACY_PAPER_PROFILE.trend.tradingCostRate;
+    * profile.trend.tradingCostRate;
   state.components.marketNeutral.equity *= 1 + marketNeutralTradingReturn;
   state.components.trend.equity *= 1 + trendTradingReturn;
-  const allocationTradingReturn = -MONTHLY_ACCURACY_PAPER_PROFILE.allocationTradingCostRate;
-  const initialReturn = MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutralWeight
+  const deployedWeight = profile.marketNeutralWeight + profile.trendWeight;
+  const allocationTradingReturn = -profile.allocationTradingCostRate * deployedWeight;
+  const initialReturn = profile.marketNeutralWeight
       * marketNeutralTradingReturn
-    + MONTHLY_ACCURACY_PAPER_PROFILE.trendWeight * trendTradingReturn
+    + profile.trendWeight * trendTradingReturn
     + allocationTradingReturn;
   const startingEquity = state.equity;
   state.equity = round(startingEquity * (1 + initialReturn), 4);
   state.peakEquity = Math.max(state.peakEquity, state.equity);
   state.maxDrawdown = round(Math.min(0, state.equity / state.peakEquity - 1));
-  const exposure = currentPositions(state, markPrices);
+  const exposure = currentPositions(state, markPrices, profile);
   Object.assign(state, exposure);
 
   const report = reportSummary(state, {
@@ -430,9 +611,39 @@ export function initializePaperState({
     tradingCost: round(-startingEquity * initialReturn, 4),
     marketNeutralReturn: round(marketNeutralTradingReturn),
     trendReturn: round(trendTradingReturn),
+    componentAttribution: {
+      marketNeutral: {
+        pricePnl: 0,
+        carryCost: 0,
+        tradingCost: round(-startingEquity * profile.marketNeutralWeight
+          * marketNeutralTradingReturn, 4),
+        totalPnl: round(startingEquity * profile.marketNeutralWeight
+          * marketNeutralTradingReturn, 4),
+      },
+      trend: {
+        pricePnl: 0,
+        carryCost: 0,
+        tradingCost: round(-startingEquity * profile.trendWeight * trendTradingReturn, 4),
+        totalPnl: round(startingEquity * profile.trendWeight * trendTradingReturn, 4),
+      },
+      allocation: {
+        tradingCost: round(-startingEquity * allocationTradingReturn, 4),
+        totalPnl: round(startingEquity * allocationTradingReturn, 4),
+      },
+    },
+    symbolAttribution: [],
+    settledNewsOverlay: null,
+    settledAdaptiveRisk: null,
+    nextNewsOverlay: marketNeutralTrade.newsDecision,
+    nextAdaptiveRisk: marketNeutralTrade.adaptiveRisk,
     notes: [
       '今天只建立模拟仓位基线，不回填开始日前收益。',
       `${state.partialStartMonth} 为月中启动的不完整月份，不计入盈利月统计。`,
+      ...(marketNeutralTrade.newsDecision
+        ? [marketNeutralTrade.newsDecision.fallbackToPriceOnly
+          ? `新闻增强未触发：${marketNeutralTrade.newsDecision.fallbackReason}。`
+          : `新闻增强已应用 ${marketNeutralTrade.newsDecision.appliedNewsWeightPercent}% 权重。`]
+        : []),
     ],
   });
   state.latestReport = report;
@@ -444,6 +655,8 @@ function prepareAfterSettlement({
   state,
   market,
   cycleDate,
+  profile,
+  newsSnapshot = null,
 }) {
   const signalDate = addUtcDays(cycleDate, -1);
   const upcomingResultDate = addUtcDays(cycleDate, 1);
@@ -452,12 +665,15 @@ function prepareAfterSettlement({
     market,
     signalDate,
     upcomingResultDate,
+    profile,
+    newsSnapshot,
   });
   const trendTrade = prepareTrend({
     component: state.components.trend,
     market,
     signalDate,
     upcomingResultDate,
+    profile,
   });
   return { signalDate, marketNeutralTrade, trendTrade };
 }
@@ -468,10 +684,13 @@ export function advancePaperState({
   markPricesByCycleDate,
   throughCycleDate,
   now = Date.now(),
+  profile = state?.profileSnapshot || MONTHLY_ACCURACY_PAPER_PROFILE,
+  newsSnapshotsByCycleDate = {},
 }) {
-  if (!state || state.version !== 1 || state.strategyProfileId !== MONTHLY_ACCURACY_PAPER_PROFILE.id) {
+  if (!state || state.version !== 1 || state.strategyProfileId !== profile.id) {
     throw new Error('模拟盘状态版本不兼容');
   }
+  if (!state.profileSnapshot) state.profileSnapshot = profileSnapshot(profile);
   const market = normalizeDailyMarket(seriesBySymbol);
   let cycleDate = addUtcDays(state.lastCycleDate, 1);
   while (cycleDate <= throughCycleDate) {
@@ -496,36 +715,60 @@ export function advancePaperState({
       state.latestPrices,
       currentPrices,
     );
+    const symbolAttribution = PAPER_SYMBOLS.map((symbol) => {
+      const assetReturn = currentPrices[symbol] / state.latestPrices[symbol] - 1;
+      const marketNeutralWeight = profile.marketNeutralWeight
+        * (state.components.marketNeutral.weights[symbol] || 0);
+      const trendWeight = profile.trendWeight * (state.components.trend.weights[symbol] || 0);
+      const marketNeutralPricePnl = startingEquity * marketNeutralWeight * assetReturn;
+      const trendPricePnl = startingEquity * trendWeight * assetReturn;
+      return {
+        symbol,
+        previousMarkPrice: round(state.latestPrices[symbol]),
+        currentMarkPrice: round(currentPrices[symbol]),
+        assetReturn: round(assetReturn),
+        marketNeutralWeight: round(marketNeutralWeight),
+        trendWeight: round(trendWeight),
+        combinedWeight: round(marketNeutralWeight + trendWeight),
+        marketNeutralPricePnl: round(marketNeutralPricePnl, 4),
+        trendPricePnl: round(trendPricePnl, 4),
+        totalPricePnl: round(marketNeutralPricePnl + trendPricePnl, 4),
+      };
+    });
     const marketNeutralCarryReturn = -sumAbsolute(state.components.marketNeutral.weights)
-      * MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutral.dailyCarryCostRate;
+      * profile.marketNeutral.dailyCarryCostRate;
     const trendCarryReturn = -sumAbsolute(state.components.trend.weights)
-      * MONTHLY_ACCURACY_PAPER_PROFILE.trend.dailyCarryCostRate;
+      * profile.trend.dailyCarryCostRate;
 
     state.components.marketNeutral.equity = marketNeutralStart
       * (1 + marketNeutralMarketReturn + marketNeutralCarryReturn);
     state.components.trend.equity = trendStart * (1 + trendMarketReturn + trendCarryReturn);
     const settledMarketNeutralMonthReturn = updateMonthlyLock(
       state.components.marketNeutral,
-      MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutral,
+      profile.marketNeutral,
     );
     const settledTrendMonthReturn = updateMonthlyLock(
       state.components.trend,
-      MONTHLY_ACCURACY_PAPER_PROFILE.trend,
+      profile.trend,
     );
     const settledLocks = {
       marketNeutral: state.components.marketNeutral.lockReason,
       trend: state.components.trend.lockReason,
     };
+    const settledNewsOverlay = state.components.marketNeutral.lastNewsDecision || null;
+    const settledAdaptiveRisk = state.components.marketNeutral.lastAdaptiveRisk || null;
 
     const { signalDate, marketNeutralTrade, trendTrade } = prepareAfterSettlement({
       state,
       market,
       cycleDate,
+      profile,
+      newsSnapshot: newsSnapshotsByCycleDate[cycleDate] || null,
     });
     const marketNeutralTradingReturn = -marketNeutralTrade.turnover
-      * MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutral.tradingCostRate;
+      * profile.marketNeutral.tradingCostRate;
     const trendTradingReturn = -trendTrade.turnover
-      * MONTHLY_ACCURACY_PAPER_PROFILE.trend.tradingCostRate;
+      * profile.trend.tradingCostRate;
     const marketNeutralReturn = marketNeutralMarketReturn
       + marketNeutralCarryReturn
       + marketNeutralTradingReturn;
@@ -533,15 +776,15 @@ export function advancePaperState({
     state.components.marketNeutral.equity = marketNeutralStart * (1 + marketNeutralReturn);
     state.components.trend.equity = trendStart * (1 + trendReturn);
 
-    const portfolioPriceReturn = MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutralWeight
+    const portfolioPriceReturn = profile.marketNeutralWeight
         * marketNeutralMarketReturn
-      + MONTHLY_ACCURACY_PAPER_PROFILE.trendWeight * trendMarketReturn;
-    const portfolioCarryReturn = MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutralWeight
+      + profile.trendWeight * trendMarketReturn;
+    const portfolioCarryReturn = profile.marketNeutralWeight
         * marketNeutralCarryReturn
-      + MONTHLY_ACCURACY_PAPER_PROFILE.trendWeight * trendCarryReturn;
-    const portfolioTradingReturn = MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutralWeight
+      + profile.trendWeight * trendCarryReturn;
+    const portfolioTradingReturn = profile.marketNeutralWeight
         * marketNeutralTradingReturn
-      + MONTHLY_ACCURACY_PAPER_PROFILE.trendWeight * trendTradingReturn;
+      + profile.trendWeight * trendTradingReturn;
     const dayReturn = portfolioPriceReturn + portfolioCarryReturn + portfolioTradingReturn;
     state.equity = round(startingEquity * (1 + dayReturn), 4);
     state.peakEquity = round(Math.max(state.peakEquity, state.equity), 4);
@@ -552,7 +795,7 @@ export function advancePaperState({
     state.latestPrices = { ...currentPrices };
     state.lastCycleDate = cycleDate;
     state.updatedAt = new Date(now).toISOString();
-    const exposure = currentPositions(state, currentPrices);
+    const exposure = currentPositions(state, currentPrices, profile);
     Object.assign(state, exposure);
 
     const report = reportSummary(state, {
@@ -572,12 +815,40 @@ export function advancePaperState({
       tradingCost: round(-startingEquity * portfolioTradingReturn, 4),
       marketNeutralReturn: round(marketNeutralReturn),
       trendReturn: round(trendReturn),
+      componentAttribution: {
+        marketNeutral: {
+          pricePnl: round(startingEquity * profile.marketNeutralWeight
+            * marketNeutralMarketReturn, 4),
+          carryCost: round(-startingEquity * profile.marketNeutralWeight
+            * marketNeutralCarryReturn, 4),
+          tradingCost: round(-startingEquity * profile.marketNeutralWeight
+            * marketNeutralTradingReturn, 4),
+          totalPnl: round(startingEquity * profile.marketNeutralWeight
+            * marketNeutralReturn, 4),
+        },
+        trend: {
+          pricePnl: round(startingEquity * profile.trendWeight * trendMarketReturn, 4),
+          carryCost: round(-startingEquity * profile.trendWeight * trendCarryReturn, 4),
+          tradingCost: round(-startingEquity * profile.trendWeight
+            * trendTradingReturn, 4),
+          totalPnl: round(startingEquity * profile.trendWeight * trendReturn, 4),
+        },
+        allocation: {
+          tradingCost: 0,
+          totalPnl: 0,
+        },
+      },
+      symbolAttribution,
       settledMonth: cycleDate.slice(0, 7),
       settledMonthReturns: {
         marketNeutral: round(settledMarketNeutralMonthReturn),
         trend: round(settledTrendMonthReturn),
       },
       settledLocks,
+      settledNewsOverlay,
+      settledAdaptiveRisk,
+      nextNewsOverlay: marketNeutralTrade.newsDecision,
+      nextAdaptiveRisk: marketNeutralTrade.adaptiveRisk,
       turnover: {
         marketNeutral: round(marketNeutralTrade.turnover),
         trend: round(trendTrade.turnover),
@@ -742,7 +1013,7 @@ export class PaperPortfolioStore {
     try {
       const current = await this.read();
       const next = await mutator(current);
-      if (next !== current) {
+      if (next !== undefined && next !== null) {
         await atomicWrite(this.filePath, `${JSON.stringify(next, null, 2)}\n`);
       }
       return next;
