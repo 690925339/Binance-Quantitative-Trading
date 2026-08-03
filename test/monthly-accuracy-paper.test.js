@@ -228,6 +228,61 @@ test('新闻质量影子根据可信度、置信度和方向强度降低边界�
   assert.ok(decision.appliedNewsWeightPercent < decision.requestedNewsWeightPercent);
 });
 
+test('新闻风险影子不改变多空选择，只在方向冲突时降低敞口', () => {
+  const series = syntheticSeries('2025-11-01', '2026-07-16');
+  const baseline = initializePaperState({
+    seriesBySymbol: series,
+    cycleDate: '2026-07-16',
+    markPrices: markPrices(series, '2026-07-15', 1.001),
+    initialCapital: 10_000,
+    now: Date.parse('2026-07-16T01:05:00.000Z'),
+  });
+  const baselineLong = baseline.positions.find((item) => item.marketNeutralWeight > 0).symbol;
+  const profile = PAPER_SHADOW_PROFILES.find((item) => item.id === 'shadow-news-risk-veto-v1');
+  const emptySummary = {
+    score: 0,
+    direction: 'neutral',
+    credibility: 0,
+    confidence: 0,
+    articleCount: 0,
+    confirmedArticleCount: 0,
+    confirmedAssessments: [],
+  };
+  const newsSnapshot = {
+    status: 'live',
+    updatedAt: '2026-07-16T01:00:00.000Z',
+    sourceStatus: [{ source: 'Official', ok: true }],
+    summary: {
+      bySymbol: Object.fromEntries(symbols.map((symbol) => [symbol, symbol === baselineLong ? {
+        score: -0.30,
+        direction: 'bearish',
+        credibility: 68,
+        confidence: 50,
+        articleCount: 3,
+        confirmedArticleCount: 0,
+        confirmedAssessments: [],
+      } : emptySummary])),
+    },
+  };
+  const guarded = initializePaperState({
+    seriesBySymbol: series,
+    cycleDate: '2026-07-16',
+    markPrices: markPrices(series, '2026-07-15', 1.001),
+    initialCapital: 10_000,
+    now: Date.parse('2026-07-16T01:05:00.000Z'),
+    profile,
+    newsSnapshot,
+  });
+  assert.deepEqual(
+    guarded.positions.map((item) => [item.symbol, Math.sign(item.weight)]),
+    baseline.positions.map((item) => [item.symbol, Math.sign(item.weight)]),
+  );
+  assert.equal(guarded.latestReport.nextNewsOverlay.riskVetoTriggered, true);
+  assert.deepEqual(guarded.latestReport.nextNewsOverlay.riskVetoConflictSymbols, [baselineLong]);
+  assert.equal(guarded.latestReport.nextNewsOverlay.appliedRiskGrossExposureScale, 0.75);
+  assert.ok(guarded.modelGrossExposure < baseline.modelGrossExposure);
+});
+
 test('新闻增强影子在新闻不可用时回退为原价格排名', () => {
   const series = syntheticSeries('2025-11-01', '2026-07-16');
   const profile = PAPER_SHADOW_PROFILES.find((item) => item.id === 'shadow-news-45-v1');

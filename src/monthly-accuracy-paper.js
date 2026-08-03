@@ -156,6 +156,17 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
   if (!settings?.enabled) return { signalContext: {}, decision: null };
   const live = newsSnapshot?.status === 'live';
   const newsWeightMode = settings.newsWeightMode || 'fixed';
+  const rankingEnabled = newsWeightMode !== 'risk_veto'
+    && Number(settings.newsSignalWeight) > 0;
+  const riskVetoEnabled = settings.riskVetoEnabled === true;
+  const riskMinimumCredibility = Number(settings.riskMinimumCredibility || 65);
+  const riskMinimumConfidence = Number(settings.riskMinimumConfidence || 50);
+  const riskMinimumArticleCount = Number(settings.riskMinimumArticleCount || 3);
+  const riskMinimumAbsoluteScore = Number(settings.riskMinimumAbsoluteScore || 0.15);
+  const riskGrossExposureScale = Math.min(
+    1,
+    Math.max(0, Number(settings.riskGrossExposureScale ?? 0.75)),
+  );
   const configuredDirectionStrength = Number(settings.directionStrengthFullWeight);
   const directionStrengthFullWeight = Number.isFinite(configuredDirectionStrength)
     && configuredDirectionStrength > 0
@@ -165,10 +176,19 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
     const summary = newsSnapshot?.summary?.bySymbol?.[symbol] || null;
     const gate = evaluateNewsGate(settings, summary);
     const score = Number(summary?.score || 0);
-    const eligible = live
+    const eligible = rankingEnabled
+      && live
       && gate.eligible
       && Number.isFinite(score)
       && Math.abs(score) >= settings.minimumAbsoluteScore;
+    const riskEligible = riskVetoEnabled
+      && live
+      && Number.isFinite(score)
+      && Math.abs(score) >= riskMinimumAbsoluteScore
+      && ['bullish', 'bearish'].includes(summary?.direction)
+      && Number(summary?.credibility || 0) >= riskMinimumCredibility
+      && Number(summary?.confidence || 0) >= riskMinimumConfidence
+      && Number(summary?.articleCount || 0) >= riskMinimumArticleCount;
     const qualityMultiplier = eligible && newsWeightMode === 'quality'
       ? Math.min(1, Math.max(0, Number(summary?.credibility || 0) / 100))
         * Math.min(1, Math.max(0, Number(summary?.confidence || 0) / 100))
@@ -179,6 +199,7 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
       symbol,
       score: round(score, 4),
       eligible,
+      riskEligible,
       gate,
       direction: summary?.direction || 'neutral',
       articleCount: summary?.articleCount || 0,
@@ -189,18 +210,26 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
     };
   });
   const eligible = evaluated.filter((item) => item.eligible);
+  const riskEligible = evaluated.filter((item) => item.riskEligible);
   const newsScoresBySymbol = Object.fromEntries(eligible.map((item) => [item.symbol, item.score]));
   const newsWeightsBySymbol = Object.fromEntries(eligible.map((item) => [
     item.symbol,
     item.appliedNewsWeightPercent / 100,
   ]));
+  const newsRiskScoresBySymbol = Object.fromEntries(riskEligible.map((item) => [
+    item.symbol,
+    item.score,
+  ]));
   const sourceStatus = newsSnapshot?.sourceStatus || [];
-  const fingerprint = eligible.length
-    ? JSON.stringify(eligible.map((item) => [
-      item.symbol,
-      item.score,
-      item.appliedNewsWeightPercent,
-    ]))
+  const fingerprint = eligible.length || riskEligible.length
+    ? JSON.stringify({
+      ranking: eligible.map((item) => [
+        item.symbol,
+        item.score,
+        item.appliedNewsWeightPercent,
+      ]),
+      risk: riskEligible.map((item) => [item.symbol, item.score]),
+    })
     : `price-only:${newsSnapshot?.status || 'missing'}`;
   const appliedWeights = eligible.map((item) => item.appliedNewsWeightPercent);
   return {
@@ -210,6 +239,8 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
         : 0,
       newsScoresBySymbol,
       newsWeightsBySymbol: newsWeightMode === 'quality' ? newsWeightsBySymbol : {},
+      newsRiskScoresBySymbol,
+      newsRiskGrossExposureScale: riskGrossExposureScale,
     },
     decision: {
       enabled: true,
@@ -221,6 +252,12 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
       averageAppliedNewsWeightPercent: appliedWeights.length
         ? round(mean(appliedWeights), 2)
         : 0,
+      riskVetoEnabled,
+      requestedRiskGrossExposureScale: riskGrossExposureScale,
+      riskEligibleSymbols: riskEligible,
+      riskVetoTriggered: false,
+      riskVetoConflictSymbols: [],
+      appliedRiskGrossExposureScale: 1,
       fallbackToPriceOnly: eligible.length === 0,
       fallbackReason: !live
         ? '新闻快照不可用或不是实时状态'
@@ -282,6 +319,7 @@ function prepareMarketNeutral({
     settings.lookbackDays,
     ...(settings.adaptiveBreadthEnabled ? settings.confirmationLookbackDays : []),
     settings.adaptiveBreadthEnabled ? settings.adaptiveVolatilityWindowDays : 0,
+    settings.spreadRiskEnabled ? settings.spreadVolatilityWindowDays : 0,
   );
   if (!Number.isInteger(signalIndex) || signalIndex < warmupDays) {
     throw new Error(`${signalDate} 横截面信号预热不足`);
@@ -303,7 +341,10 @@ function prepareMarketNeutral({
       market.symbols,
       signalIndex,
       settings,
-      news.signalContext,
+      {
+        ...news.signalContext,
+        currentWeights: component.baseWeights,
+      },
     );
     proposedBaseWeights = allocation.weights;
     proposedLeverage = allocation.leverage;
@@ -351,8 +392,25 @@ function prepareMarketNeutral({
   }
   component.weights = nextWeights;
   if (news.decision) {
+    const previousNewsDecision = component.lastNewsDecision || null;
+    const riskVetoTriggered = component.lockReason === null && (allocation
+      ? Boolean(allocation.adaptiveRisk?.newsRiskVetoTriggered)
+      : Boolean(previousNewsDecision?.riskVetoTriggered));
     component.lastNewsDecision = {
       ...news.decision,
+      riskVetoTriggered,
+      riskVetoConflictSymbols: riskVetoTriggered
+        ? (allocation
+          ? allocation.adaptiveRisk?.newsRiskConflictSymbols || []
+          : previousNewsDecision?.riskVetoConflictSymbols || [])
+        : [],
+      appliedRiskGrossExposureScale: riskVetoTriggered
+        ? (allocation
+          ? allocation.adaptiveRisk?.newsRiskGrossExposureScale ?? 1
+          : previousNewsDecision?.appliedRiskGrossExposureScale ?? 1)
+        : 1,
+      fallbackToPriceOnly: news.decision.fallbackToPriceOnly && !riskVetoTriggered,
+      fallbackReason: riskVetoTriggered ? null : news.decision.fallbackReason,
       selectedLongSymbols: Object.entries(nextWeights)
         .filter(([, weight]) => weight > 0)
         .map(([symbol]) => symbol),
@@ -366,7 +424,7 @@ function prepareMarketNeutral({
         newsWeightPercent: round((item.newsWeight || 0) * 100, 2),
         newsEligible: item.newsEligible,
         rankingScore: round(item.rankingScore, 4),
-      })) || null,
+      })) || previousNewsDecision?.ranking || null,
     };
   }
   return {

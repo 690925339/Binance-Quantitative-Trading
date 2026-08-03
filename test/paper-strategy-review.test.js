@@ -115,6 +115,121 @@ test('影子候选启动后保持独立ID，并在小样本阶段只采样不晋
   assert.match(review.latestAttribution.diagnostics.join(' '), /横截面/);
 });
 
+test('趋势月度锁定后复盘会提示横截面独自承担主要风险', () => {
+  const baseline = stateFor(MONTHLY_ACCURACY_PAPER_PROFILE, {
+    observations: 2,
+    dailyReturn: -0.002,
+    attribution: true,
+  });
+  baseline.latestReport.settledLocks = { marketNeutral: null, trend: 'profit' };
+  const shadows = PAPER_SHADOW_PROFILES.map((profile) => stateFor(profile, {
+    observations: 2,
+    dailyReturn: -0.001,
+  }));
+  const review = buildPaperStrategyReview({ baselineState: baseline, shadowStates: shadows });
+  assert.equal(review.latestAttribution.trendLockReason, 'profit');
+  assert.match(review.latestAttribution.diagnostics.join(' '), /趋势子策略已触发月度止盈锁定/);
+});
+
+test('高换手日复盘会拆分价格收益、成本拖累和子策略换手', () => {
+  const baseline = stateFor(MONTHLY_ACCURACY_PAPER_PROFILE, {
+    observations: 2,
+    dailyReturn: 0.001,
+    attribution: true,
+  });
+  baseline.latestReport.pricePnl = 26;
+  baseline.latestReport.dayPnl = 12;
+  baseline.latestReport.tradingCost = 13;
+  baseline.latestReport.carryCost = 1;
+  baseline.latestReport.turnover = { marketNeutral: 2.1, trend: 0.8 };
+  const review = buildPaperStrategyReview({ baselineState: baseline, shadowStates: [] });
+  assert.equal(review.latestAttribution.costShareOfAbsolutePricePnl, 0.53846154);
+  assert.equal(review.latestAttribution.tradingCostShareOfAbsolutePricePnl, 0.5);
+  assert.deepEqual(review.latestAttribution.turnover, {
+    marketNeutral: 2.1,
+    trend: 0.8,
+    total: 2.9,
+  });
+  assert.match(review.latestAttribution.diagnostics.join(' '), /本次调仓总换手 2.90 倍/);
+});
+
+test('新闻影子会统计真实触发天数而不是把价格回退当作新闻贡献', () => {
+  const baseline = stateFor(MONTHLY_ACCURACY_PAPER_PROFILE, {
+    observations: 3,
+    dailyReturn: 0.001,
+  });
+  const profile = PAPER_SHADOW_PROFILES.find((item) => item.id === 'shadow-news-adaptive-v1');
+  const candidate = stateFor(profile, {
+    observations: 3,
+    dailyReturn: 0.0011,
+  });
+  const reports = candidate.reports.filter((report) => report.kind === 'daily');
+  reports[0].settledNewsOverlay = {
+    enabled: true,
+    fallbackToPriceOnly: true,
+    fallbackReason: '新闻未通过门槛',
+    appliedNewsWeightPercent: 0,
+  };
+  reports[1].settledNewsOverlay = {
+    enabled: true,
+    fallbackToPriceOnly: false,
+    appliedNewsWeightPercent: 18,
+  };
+  reports[2].settledNewsOverlay = {
+    enabled: true,
+    fallbackToPriceOnly: true,
+    fallbackReason: '新闻未通过门槛',
+    appliedNewsWeightPercent: 0,
+  };
+  const review = buildPaperStrategyReview({ baselineState: baseline, shadowStates: [candidate] });
+  const result = review.candidates.find((item) => item.id === profile.id);
+  assert.deepEqual(result.newsEvidence, {
+    evaluatedDays: 3,
+    activeDays: 1,
+    fallbackDays: 2,
+    activationRatio: 0.33333333,
+    averageAppliedNewsWeightPercent: 6,
+    riskVetoDays: 0,
+    averageAppliedRiskGrossExposureScale: 1,
+    dominantFallbackReason: '新闻未通过门槛',
+  });
+});
+
+test('新闻风险影子把降敞口计为风控触发而不是方向新闻权重', () => {
+  const baseline = stateFor(MONTHLY_ACCURACY_PAPER_PROFILE, {
+    observations: 2,
+    dailyReturn: 0.001,
+  });
+  const profile = PAPER_SHADOW_PROFILES.find((item) => item.id === 'shadow-news-risk-veto-v1');
+  const candidate = stateFor(profile, {
+    observations: 2,
+    dailyReturn: 0.0008,
+  });
+  const reports = candidate.reports.filter((report) => report.kind === 'daily');
+  reports[0].settledNewsOverlay = {
+    enabled: true,
+    fallbackToPriceOnly: false,
+    appliedNewsWeightPercent: 0,
+    riskVetoTriggered: true,
+    appliedRiskGrossExposureScale: 0.75,
+  };
+  reports[1].settledNewsOverlay = {
+    enabled: true,
+    fallbackToPriceOnly: true,
+    fallbackReason: '没有持仓方向冲突',
+    appliedNewsWeightPercent: 0,
+    riskVetoTriggered: false,
+    appliedRiskGrossExposureScale: 1,
+  };
+  const review = buildPaperStrategyReview({ baselineState: baseline, shadowStates: [candidate] });
+  const result = review.candidates.find((item) => item.id === profile.id);
+  assert.equal(result.newsEvidence.activeDays, 1);
+  assert.equal(result.newsEvidence.riskVetoDays, 1);
+  assert.equal(result.newsEvidence.activationRatio, 0.5);
+  assert.equal(result.newsEvidence.averageAppliedNewsWeightPercent, 0);
+  assert.equal(result.newsEvidence.averageAppliedRiskGrossExposureScale, 0.875);
+});
+
 test('长期前向指标全部达标也只标记为人工晋级复核', () => {
   const observations = 580;
   const baseline = stateFor(MONTHLY_ACCURACY_PAPER_PROFILE, {

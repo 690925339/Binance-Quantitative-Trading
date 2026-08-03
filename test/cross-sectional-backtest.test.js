@@ -172,6 +172,45 @@ test('高可信新闻可以按45%权重改变横截面排名，缺少新闻时�
   );
 });
 
+test('风险型新闻只在持仓方向冲突时对称降低总敞口', () => {
+  const closesBySymbol = {
+    AAAUSDT: [100, 110],
+    BBBUSDT: [100, 106],
+    CCCUSDT: [100, 98],
+    DDDUSDT: [100, 90],
+  };
+  const symbols = Object.keys(closesBySymbol);
+  const settings = {
+    lookbackDays: 1,
+    positionsPerSide: 1,
+    mode: 'momentum',
+    dynamicLeverageEnabled: false,
+    dynamicLeverageMax: 1,
+    dispersionTarget: 0.15,
+    baseGrossExposure: 1,
+    maxGrossExposure: 1,
+  };
+  const baseline = calculateCrossSectionalWeights(closesBySymbol, symbols, 1, settings);
+  const guarded = calculateCrossSectionalWeights(
+    closesBySymbol,
+    symbols,
+    1,
+    settings,
+    {
+      newsRiskScoresBySymbol: { AAAUSDT: -0.4 },
+      newsRiskGrossExposureScale: 0.75,
+    },
+  );
+  assert.deepEqual(
+    Object.entries(guarded.weights).map(([symbol, weight]) => [symbol, Math.sign(weight)]),
+    Object.entries(baseline.weights).map(([symbol, weight]) => [symbol, Math.sign(weight)]),
+  );
+  assert.equal(guarded.grossExposure, 0.75);
+  assert.equal(guarded.adaptiveRisk.newsRiskVetoTriggered, true);
+  assert.equal(guarded.adaptiveRisk.newsRiskGrossExposureScale, 0.75);
+  assert.deepEqual(guarded.adaptiveRisk.newsRiskConflictSymbols, ['AAAUSDT']);
+});
+
 test('月度盈利锁定会产生空仓日并降低平均敞口', () => {
   const unlocked = runCrossSectionalBacktest(syntheticSeries(), { lookbackDays: 10 });
   const locked = runCrossSectionalBacktest(syntheticSeries(), {
@@ -281,4 +320,136 @@ test('自适应横截面默认关闭时不会改变冻结基准净值', () => {
     adaptiveBreadthEnabled: false,
   });
   assert.deepEqual(explicitlyDisabled.equityCurve, baseline.equityCurve);
+});
+
+test('自适应横截面关闭时允许普通持仓宽度超过自适应默认值', () => {
+  const baseSeries = syntheticSeries();
+  const template = baseSeries.AAAUSDT;
+  const series = {
+    ...baseSeries,
+    EEEUSDT: template.map((item, index) => ({ ...item, close: item.close * (1 + index / 10_000) })),
+    FFFUSDT: template.map((item, index) => ({ ...item, close: item.close * (1 - index / 20_000) })),
+  };
+  const result = runCrossSectionalBacktest(series, {
+    lookbackDays: 10,
+    positionsPerSide: 3,
+    adaptiveBreadthEnabled: false,
+  });
+  assert.equal(result.settings.positionsPerSide, 3);
+  assert.equal(result.settings.adaptiveBreadthEnabled, false);
+});
+
+test('选中价差波动异常时只缩减敞口，默认关闭时保持原权重', () => {
+  const symbols = ['AAAUSDT', 'BBBUSDT', 'CCCUSDT', 'DDDUSDT'];
+  const closesBySymbol = Object.fromEntries(symbols.map((symbol, symbolIndex) => {
+    let close = 100;
+    return [symbol, Array.from({ length: 31 }, (_, index) => {
+      if (index > 0) {
+        const alternatingShock = index % 2 === 0 ? 0.08 : -0.08;
+        const dailyLogReturn = symbolIndex === 0
+          ? 0.015 + alternatingShock
+          : symbolIndex === 3
+            ? -0.015 - alternatingShock
+            : (1.5 - symbolIndex) * 0.001;
+        close *= Math.exp(dailyLogReturn);
+      }
+      return close;
+    })];
+  }));
+  const settings = {
+    lookbackDays: 10,
+    positionsPerSide: 1,
+    mode: 'momentum',
+    dynamicLeverageEnabled: false,
+    dynamicLeverageMax: 1,
+    dispersionTarget: 0.15,
+    baseGrossExposure: 1,
+    maxGrossExposure: 1,
+  };
+  const baseline = calculateCrossSectionalWeights(closesBySymbol, symbols, 30, settings);
+  const guarded = calculateCrossSectionalWeights(closesBySymbol, symbols, 30, {
+    ...settings,
+    spreadRiskEnabled: true,
+    spreadVolatilityWindowDays: 10,
+    spreadVolatilityTarget: 0.10,
+    minimumSpreadRiskScale: 0.25,
+  });
+  assert.equal(baseline.grossExposure, 1);
+  assert.equal(guarded.adaptiveRisk.spreadRiskScaled, true);
+  assert.equal(guarded.adaptiveRisk.spreadRiskScale, 0.25);
+  assert.equal(guarded.grossExposure, 0.25);
+});
+
+test('选中价差异常时可临时扩大持仓宽度而不降低总敞口', () => {
+  const symbols = ['AAAUSDT', 'BBBUSDT', 'CCCUSDT', 'DDDUSDT'];
+  const closesBySymbol = Object.fromEntries(symbols.map((symbol, symbolIndex) => {
+    let close = 100;
+    return [symbol, Array.from({ length: 31 }, (_, index) => {
+      if (index > 0) {
+        const shock = index % 2 === 0 ? 0.08 : -0.08;
+        close *= Math.exp((1.5 - symbolIndex) * 0.01 + (symbolIndex === 0 ? shock : symbolIndex === 3 ? -shock : 0));
+      }
+      return close;
+    })];
+  }));
+  const allocation = calculateCrossSectionalWeights(closesBySymbol, symbols, 30, {
+    lookbackDays: 10,
+    positionsPerSide: 1,
+    mode: 'momentum',
+    dynamicLeverageEnabled: false,
+    dynamicLeverageMax: 1,
+    dispersionTarget: 0.15,
+    baseGrossExposure: 1,
+    maxGrossExposure: 1,
+    spreadRiskEnabled: true,
+    spreadVolatilityWindowDays: 10,
+    spreadVolatilityTarget: 0.10,
+    minimumSpreadRiskScale: 1,
+    spreadRiskPositionsPerSide: 2,
+  });
+  assert.equal(allocation.adaptiveRisk.spreadRiskTriggered, true);
+  assert.equal(allocation.adaptiveRisk.effectivePositionsPerSide, 2);
+  assert.equal(Object.values(allocation.weights).filter((weight) => weight !== 0).length, 4);
+  assert.equal(allocation.grossExposure, 1);
+});
+
+test('排名滞回只在新旧信号分差不足时保留原多空腿', () => {
+  const symbols = ['AAAUSDT', 'BBBUSDT', 'CCCUSDT', 'DDDUSDT'];
+  const closesBySymbol = {
+    AAAUSDT: [100, 110],
+    BBBUSDT: [100, 109],
+    CCCUSDT: [100, 91],
+    DDDUSDT: [100, 90],
+  };
+  const settings = {
+    lookbackDays: 1,
+    positionsPerSide: 1,
+    mode: 'momentum',
+    dynamicLeverageEnabled: false,
+    dynamicLeverageMax: 1,
+    dispersionTarget: 0.15,
+    baseGrossExposure: 1,
+    maxGrossExposure: 1,
+    selectionHysteresisEnabled: true,
+    selectionRetentionBufferRanks: 1,
+    minimumSelectionSwitchGap: 0.15,
+  };
+  const retained = calculateCrossSectionalWeights(closesBySymbol, symbols, 1, settings, {
+    currentWeights: { AAAUSDT: 0, BBBUSDT: 0.5, CCCUSDT: -0.5, DDDUSDT: 0 },
+  });
+  assert.equal(retained.weights.BBBUSDT, 0.5);
+  assert.equal(retained.weights.CCCUSDT, -0.5);
+  assert.deepEqual(retained.selectionHysteresis.retainedStrongestSymbols, ['BBBUSDT']);
+  assert.deepEqual(retained.selectionHysteresis.retainedWeakestSymbols, ['CCCUSDT']);
+
+  const switched = calculateCrossSectionalWeights({
+    ...closesBySymbol,
+    BBBUSDT: [100, 104],
+    CCCUSDT: [100, 96],
+  }, symbols, 1, settings, {
+    currentWeights: { AAAUSDT: 0, BBBUSDT: 0.5, CCCUSDT: -0.5, DDDUSDT: 0 },
+  });
+  assert.equal(switched.weights.AAAUSDT, 0.5);
+  assert.equal(switched.weights.DDDUSDT, -0.5);
+  assert.equal(switched.selectionHysteresis.retainedCount, 0);
 });

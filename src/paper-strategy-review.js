@@ -78,6 +78,29 @@ export const PAPER_SHADOW_PROFILES = Object.freeze([
     },
     cashWeight: 0,
   }),
+  frozenProfile({
+    id: 'shadow-news-risk-veto-v1',
+    name: '新闻风控影子｜方向冲突时敞口75%',
+    role: 'news_risk_veto',
+    hypothesis: '中等质量新闻不直接决定多空，只在与价格持仓方向冲突时将横截面总敞口降至75%。',
+    newsOverlay: {
+      enabled: true,
+      newsWeightMode: 'risk_veto',
+      priceSignalWeight: 100,
+      newsSignalWeight: 0,
+      minimumNewsCredibility: 75,
+      minimumNewsConfidence: 65,
+      minimumConfirmedArticles: 1,
+      minimumAbsoluteScore: 0.12,
+      riskVetoEnabled: true,
+      riskMinimumCredibility: 65,
+      riskMinimumConfidence: 50,
+      riskMinimumArticleCount: 3,
+      riskMinimumAbsoluteScore: 0.15,
+      riskGrossExposureScale: 0.75,
+    },
+    cashWeight: 0,
+  }),
 ]);
 
 export const PAPER_REVIEW_POLICY = Object.freeze({
@@ -343,6 +366,54 @@ function candidateGate(candidate, benchmark, adjustedBootstrapP) {
   return { status: 'reviewable', reason: '样本可用于诊断，但尚未同时满足长期收益、回撤和统计显著性门槛。' };
 }
 
+function newsEvidence(state, acceptedDates) {
+  const decisions = dailyReports(state)
+    .filter((report) => acceptedDates.has(report.cycleDate))
+    .map((report) => report.settledNewsOverlay)
+    .filter((decision) => decision?.enabled);
+  if (!decisions.length) {
+    return {
+      evaluatedDays: 0,
+      activeDays: 0,
+      fallbackDays: 0,
+      activationRatio: null,
+      averageAppliedNewsWeightPercent: null,
+      riskVetoDays: 0,
+      averageAppliedRiskGrossExposureScale: null,
+      dominantFallbackReason: null,
+    };
+  }
+  const active = decisions.filter((decision) => (
+    !decision.fallbackToPriceOnly
+    && (Number(decision.appliedNewsWeightPercent || 0) > 0 || decision.riskVetoTriggered)
+  ));
+  const riskVeto = decisions.filter((decision) => decision.riskVetoTriggered);
+  const fallback = decisions.filter((decision) => decision.fallbackToPriceOnly);
+  const reasons = new Map();
+  for (const decision of fallback) {
+    const reason = decision.fallbackReason || '未记录回退原因';
+    reasons.set(reason, (reasons.get(reason) || 0) + 1);
+  }
+  const dominantFallbackReason = [...reasons.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0] || null;
+  return {
+    evaluatedDays: decisions.length,
+    activeDays: active.length,
+    fallbackDays: fallback.length,
+    activationRatio: round(active.length / decisions.length),
+    averageAppliedNewsWeightPercent: round(mean(decisions.map((decision) => (
+      Number(decision.averageAppliedNewsWeightPercent
+        ?? decision.appliedNewsWeightPercent
+        ?? 0)
+    ))), 4),
+    riskVetoDays: riskVeto.length,
+    averageAppliedRiskGrossExposureScale: round(mean(decisions.map((decision) => (
+      Number(decision.appliedRiskGrossExposureScale ?? 1)
+    )))),
+    dominantFallbackReason,
+  };
+}
+
 function matchedCandidate(baselineState, candidateState, profile, trialCount) {
   if (!candidateState) {
     return {
@@ -418,6 +489,9 @@ function matchedCandidate(baselineState, candidateState, profile, trialCount) {
       bootstrapP: round(bootstrapP),
       adjustedBootstrapP: round(adjustedBootstrapP),
     },
+    newsEvidence: effectiveProfile.newsOverlay?.enabled
+      ? newsEvidence(candidateState, acceptedDates)
+      : null,
     latestNewsDecision: candidateState.components?.marketNeutral?.lastNewsDecision || null,
   };
 }
@@ -431,6 +505,12 @@ function latestAttribution(state) {
   const marketNeutral = report.componentAttribution?.marketNeutral;
   const trend = report.componentAttribution?.trend;
   const totalCost = Number(report.tradingCost || 0) + Number(report.carryCost || 0);
+  const absolutePricePnl = Math.abs(Number(report.pricePnl || 0));
+  const turnover = {
+    marketNeutral: round(Number(report.turnover?.marketNeutral || 0)),
+    trend: round(Number(report.turnover?.trend || 0)),
+  };
+  turnover.total = round(turnover.marketNeutral + turnover.trend);
   const marketNeutralGross = report.symbolAttribution.reduce((sum, item) => (
     sum + Math.abs(Number(item.marketNeutralWeight || 0))
   ), 0);
@@ -469,8 +549,17 @@ function latestAttribution(state) {
   if (marketNeutralGross > 0 && largestTwoMarketNeutral / marketNeutralGross >= 0.75) {
     diagnostics.push('横截面风险集中在少数多空腿，普通价差反转会被动态杠杆放大。');
   }
+  const trendLockReason = report.settledLocks?.trend || null;
+  if (marketNeutralGross > 0 && trendLockReason === 'profit') {
+    diagnostics.push('趋势子策略已触发月度止盈锁定，本月剩余时间由横截面仓位独自承担主要风险。');
+  } else if (marketNeutralGross > 0 && trendLockReason === 'loss') {
+    diagnostics.push('趋势子策略已触发月度止损锁定，本月剩余时间不再提供趋势对冲。');
+  }
   if (Math.abs(Number(report.dayPnl || 0)) > 0 && totalCost / Math.abs(report.dayPnl) >= 0.25) {
     diagnostics.push('成本占当日波动较高，需要检查换手和持仓成本。');
+  }
+  if (turnover.total >= 1) {
+    diagnostics.push(`本次调仓总换手 ${turnover.total.toFixed(2)} 倍，其中横截面 ${turnover.marketNeutral.toFixed(2)} 倍、趋势 ${turnover.trend.toFixed(2)} 倍。`);
   }
   if (!diagnostics.length) diagnostics.push('当前没有单一异常标签，继续积累前向样本。');
   return {
@@ -483,6 +572,13 @@ function latestAttribution(state) {
     costShareOfAbsolutePnl: Math.abs(Number(report.dayPnl || 0)) > 0
       ? round(totalCost / Math.abs(report.dayPnl))
       : null,
+    costShareOfAbsolutePricePnl: absolutePricePnl > 0
+      ? round(totalCost / absolutePricePnl)
+      : null,
+    tradingCostShareOfAbsolutePricePnl: absolutePricePnl > 0
+      ? round(Number(report.tradingCost || 0) / absolutePricePnl)
+      : null,
+    turnover,
     marketNeutral,
     trend,
     largestDetractor: symbols[0],
@@ -491,6 +587,7 @@ function latestAttribution(state) {
       ? round(largestTwoMarketNeutral / marketNeutralGross)
       : null,
     marketNeutralSpreadMove: round(marketNeutralSpreadMove),
+    trendLockReason,
     diagnostics,
     symbols,
   };
@@ -624,12 +721,15 @@ export async function writePaperReviewArtifacts(rootDir, review) {
       '## 最新损益归因',
       '',
       `- 当日盈亏：${money(attribution.dayPnl)}（${percent(attribution.dayReturn)}）`,
+      `- 价格收益：${money(attribution.pricePnl)}`,
       `- 横截面子策略：${money(attribution.marketNeutral?.totalPnl)}`,
       `- 趋势子策略：${money(attribution.trend?.totalPnl)}`,
       `- 横截面多空价差变化：${percent(attribution.marketNeutralSpreadMove)}`,
       `- 最大拖累：${attribution.largestDetractor.symbol} ${money(attribution.largestDetractor.totalPricePnl)}`,
       `- 最大贡献：${attribution.largestContributor.symbol} ${money(attribution.largestContributor.totalPricePnl)}`,
       `- 成本占绝对盈亏：${percent(attribution.costShareOfAbsolutePnl)}`,
+      `- 成本占价格收益：${percent(attribution.costShareOfAbsolutePricePnl)}`,
+      `- 调仓换手：横截面 ${attribution.turnover.marketNeutral.toFixed(2)} 倍、趋势 ${attribution.turnover.trend.toFixed(2)} 倍、合计 ${attribution.turnover.total.toFixed(2)} 倍`,
       '',
       ...attribution.diagnostics.map((item) => `- 诊断：${item}`),
       '',
@@ -649,6 +749,16 @@ export async function writePaperReviewArtifacts(rootDir, review) {
     ...review.candidates.map((candidate) => (
       `| ${candidate.name} | ${candidate.status} | ${candidate.metrics?.observations || 0}天 | ${candidate.metrics?.fullMonthCount || 0} | ${percent(candidate.metrics?.pairedExcessReturn)} |`
     )),
+    '',
+    ...review.candidates.flatMap((candidate) => candidate.newsEvidence ? [
+      `- ${candidate.name}新闻触发：${candidate.newsEvidence.activeDays}/${candidate.newsEvidence.evaluatedDays} 天（${percent(candidate.newsEvidence.activationRatio)}），平均实际权重 ${Number(candidate.newsEvidence.averageAppliedNewsWeightPercent || 0).toFixed(2)}%。`,
+      ...(candidate.newsEvidence.riskVetoDays
+        ? [`  - 风控降敞口：${candidate.newsEvidence.riskVetoDays} 天，平均敞口缩放 ${percent(candidate.newsEvidence.averageAppliedRiskGrossExposureScale)}。`]
+        : []),
+      ...(candidate.newsEvidence.dominantFallbackReason
+        ? [`  - 主要回退原因：${candidate.newsEvidence.dominantFallbackReason}`]
+        : []),
+    ] : []),
     '',
     '> 影子候选参数启动后保持冻结。任何参数变化必须创建新ID并重新积累前向样本。',
     '',

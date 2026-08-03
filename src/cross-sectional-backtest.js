@@ -33,6 +33,14 @@ const DEFAULTS = Object.freeze({
   maximumAdaptiveMarketVolatility: null,
   highVolatilityGrossExposureScale: 0.5,
   maximumSingleAssetExposure: null,
+  spreadRiskEnabled: false,
+  spreadVolatilityWindowDays: 20,
+  spreadVolatilityTarget: 0.60,
+  minimumSpreadRiskScale: 0.50,
+  spreadRiskPositionsPerSide: null,
+  selectionHysteresisEnabled: false,
+  selectionRetentionBufferRanks: 1,
+  minimumSelectionSwitchGap: 0.10,
 });
 
 function mean(values) {
@@ -133,7 +141,9 @@ function mergeOptions(options) {
   }
   settings.confirmationLookbackDays = [...new Set(settings.confirmationLookbackDays)];
   if (!Number.isInteger(settings.uncertainPositionsPerSide)
-    || settings.uncertainPositionsPerSide < settings.positionsPerSide) {
+    || settings.uncertainPositionsPerSide < 1
+    || (settings.adaptiveBreadthEnabled
+      && settings.uncertainPositionsPerSide < settings.positionsPerSide)) {
     throw new Error('uncertainPositionsPerSide 不能小于 positionsPerSide');
   }
   for (const key of [
@@ -171,14 +181,53 @@ function mergeOptions(options) {
       || settings.maximumSingleAssetExposure > 1)) {
     throw new Error('maximumSingleAssetExposure 必须在 0 到 1 之间，或设为 null');
   }
+  if (typeof settings.spreadRiskEnabled !== 'boolean') {
+    throw new Error('spreadRiskEnabled 必须是布尔值');
+  }
+  if (!Number.isInteger(settings.spreadVolatilityWindowDays)
+    || settings.spreadVolatilityWindowDays < 2) {
+    throw new Error('spreadVolatilityWindowDays 必须是大于等于 2 的整数');
+  }
+  if (!Number.isFinite(settings.spreadVolatilityTarget)
+    || settings.spreadVolatilityTarget <= 0) {
+    throw new Error('spreadVolatilityTarget 必须大于 0');
+  }
+  if (!Number.isFinite(settings.minimumSpreadRiskScale)
+    || settings.minimumSpreadRiskScale < 0
+    || settings.minimumSpreadRiskScale > 1) {
+    throw new Error('minimumSpreadRiskScale 必须在 0 到 1 之间');
+  }
+  if (settings.spreadRiskPositionsPerSide !== null
+    && (!Number.isInteger(settings.spreadRiskPositionsPerSide)
+      || settings.spreadRiskPositionsPerSide < settings.positionsPerSide)) {
+    throw new Error('spreadRiskPositionsPerSide 不能小于 positionsPerSide，或设为 null');
+  }
+  if (typeof settings.selectionHysteresisEnabled !== 'boolean') {
+    throw new Error('selectionHysteresisEnabled 必须是布尔值');
+  }
+  if (!Number.isInteger(settings.selectionRetentionBufferRanks)
+    || settings.selectionRetentionBufferRanks < 0
+    || settings.selectionRetentionBufferRanks > 10) {
+    throw new Error('selectionRetentionBufferRanks 必须是 0 到 10 的整数');
+  }
+  if (!Number.isFinite(settings.minimumSelectionSwitchGap)
+    || settings.minimumSelectionSwitchGap < 0
+    || settings.minimumSelectionSwitchGap > 2) {
+    throw new Error('minimumSelectionSwitchGap 必须在 0 到 2 之间');
+  }
   return settings;
 }
 
 function validateSeries(seriesBySymbol, settings) {
   const entries = Object.entries(seriesBySymbol || {});
-  const requiredPositions = settings.adaptiveBreadthEnabled
-    ? settings.uncertainPositionsPerSide
-    : settings.positionsPerSide;
+  const requiredPositions = Math.max(
+    settings.adaptiveBreadthEnabled
+      ? settings.uncertainPositionsPerSide
+      : settings.positionsPerSide,
+    settings.spreadRiskEnabled && settings.spreadRiskPositionsPerSide !== null
+      ? settings.spreadRiskPositionsPerSide
+      : settings.positionsPerSide,
+  );
   if (entries.length < requiredPositions * 2) throw new Error('交易对数量不足以建立多空两侧仓位');
   const dates = entries[0]?.[1]?.map((item) => item.date);
   if (!dates?.length) throw new Error('行情序列不能为空');
@@ -273,6 +322,114 @@ function calculateAdaptiveRisk({
   };
 }
 
+function calculateSelectedSpreadRisk({
+  closesBySymbol,
+  index,
+  strongest,
+  weakest,
+  settings,
+}) {
+  if (!settings.spreadRiskEnabled) {
+    return {
+      enabled: false,
+      selectedSpreadVolatility: null,
+      spreadRiskScale: 1,
+      scaled: false,
+      triggered: false,
+    };
+  }
+  const windowDays = settings.spreadVolatilityWindowDays;
+  if (index < windowDays) {
+    return {
+      enabled: true,
+      selectedSpreadVolatility: null,
+      spreadRiskScale: 1,
+      scaled: false,
+      triggered: false,
+    };
+  }
+  const spreadReturns = [];
+  for (let cursor = index - windowDays + 1; cursor <= index; cursor += 1) {
+    const longReturn = mean(strongest.map((item) => (
+      Math.log(closesBySymbol[item.symbol][cursor] / closesBySymbol[item.symbol][cursor - 1])
+    )));
+    const shortReturn = mean(weakest.map((item) => (
+      Math.log(closesBySymbol[item.symbol][cursor] / closesBySymbol[item.symbol][cursor - 1])
+    )));
+    spreadReturns.push(longReturn - shortReturn);
+  }
+  const selectedSpreadVolatility = sampleStandardDeviation(spreadReturns) * Math.sqrt(DAYS_PER_YEAR);
+  const rawScale = selectedSpreadVolatility > settings.spreadVolatilityTarget
+    ? settings.spreadVolatilityTarget / selectedSpreadVolatility
+    : 1;
+  const spreadRiskScale = Math.max(settings.minimumSpreadRiskScale, Math.min(1, rawScale));
+  return {
+    enabled: true,
+    selectedSpreadVolatility,
+    spreadRiskScale,
+    scaled: spreadRiskScale < 1,
+    triggered: rawScale < 1,
+  };
+}
+
+function currentSymbolsForExtreme(currentWeights, mode, strongestSide) {
+  if (!currentWeights) return [];
+  const expectedSign = strongestSide
+    ? (mode === 'momentum' ? 1 : -1)
+    : (mode === 'momentum' ? -1 : 1);
+  return Object.entries(currentWeights)
+    .filter(([, weight]) => Math.sign(Number(weight) || 0) === expectedSign)
+    .map(([symbol]) => symbol);
+}
+
+function retainExtremeSelection({
+  ranked,
+  selected,
+  positionsPerSide,
+  currentSymbols,
+  strongestSide,
+  settings,
+}) {
+  if (!settings.selectionHysteresisEnabled || !currentSymbols.length) {
+    return { selected, retainedSymbols: [], switchGaps: [] };
+  }
+  const rankingIndex = new Map(ranked.map((item, rank) => [item.symbol, rank]));
+  const rankingBySymbol = new Map(ranked.map((item) => [item.symbol, item]));
+  const selectedSymbols = new Set(selected.map((item) => item.symbol));
+  const maximumRank = positionsPerSide + settings.selectionRetentionBufferRanks - 1;
+  const minimumRank = ranked.length - positionsPerSide - settings.selectionRetentionBufferRanks;
+  const eligibleIncumbents = currentSymbols
+    .filter((symbol) => !selectedSymbols.has(symbol) && rankingBySymbol.has(symbol))
+    .filter((symbol) => (
+      strongestSide
+        ? rankingIndex.get(symbol) <= maximumRank
+        : rankingIndex.get(symbol) >= minimumRank
+    ));
+  const nextSelected = [...selected];
+  const retainedSymbols = [];
+  const switchGaps = [];
+  for (const incumbentSymbol of eligibleIncumbents) {
+    const currentSelectedSymbols = new Set(nextSelected.map((item) => item.symbol));
+    const replaceable = nextSelected
+      .map((item, selectedIndex) => ({ item, selectedIndex }))
+      .filter(({ item }) => !currentSymbols.includes(item.symbol));
+    if (!replaceable.length || currentSelectedSymbols.has(incumbentSymbol)) continue;
+    const challenger = strongestSide
+      ? replaceable.sort((left, right) => left.item.rankingScore - right.item.rankingScore)[0]
+      : replaceable.sort((left, right) => right.item.rankingScore - left.item.rankingScore)[0];
+    const incumbent = rankingBySymbol.get(incumbentSymbol);
+    const improvement = strongestSide
+      ? challenger.item.rankingScore - incumbent.rankingScore
+      : incumbent.rankingScore - challenger.item.rankingScore;
+    if (improvement < settings.minimumSelectionSwitchGap) {
+      nextSelected[challenger.selectedIndex] = incumbent;
+      retainedSymbols.push(incumbentSymbol);
+      switchGaps.push(improvement);
+    }
+  }
+  return { selected: nextSelected, retainedSymbols, switchGaps };
+}
+
 export function calculateCrossSectionalWeights(
   closesBySymbol,
   symbols,
@@ -325,9 +482,48 @@ export function calculateCrossSectionalWeights(
     ranked,
     settings,
   });
-  const positionsPerSide = adaptiveRisk.effectivePositionsPerSide;
-  const strongest = ranked.slice(0, positionsPerSide);
-  const weakest = ranked.slice(-positionsPerSide);
+  const basePositionsPerSide = adaptiveRisk.effectivePositionsPerSide;
+  let strongest = ranked.slice(0, basePositionsPerSide);
+  let weakest = ranked.slice(-basePositionsPerSide);
+  const selectedSpreadRisk = calculateSelectedSpreadRisk({
+    closesBySymbol,
+    index,
+    strongest,
+    weakest,
+    settings,
+  });
+  const positionsPerSide = selectedSpreadRisk.triggered
+    && Number.isInteger(settings.spreadRiskPositionsPerSide)
+    ? Math.max(basePositionsPerSide, settings.spreadRiskPositionsPerSide)
+    : basePositionsPerSide;
+  strongest = ranked.slice(0, positionsPerSide);
+  weakest = ranked.slice(-positionsPerSide);
+  const currentWeights = signalContext.currentWeights || null;
+  const retainedStrongest = retainExtremeSelection({
+    ranked,
+    selected: strongest,
+    positionsPerSide,
+    currentSymbols: currentSymbolsForExtreme(currentWeights, settings.mode, true),
+    strongestSide: true,
+    settings,
+  });
+  const retainedWeakest = retainExtremeSelection({
+    ranked,
+    selected: weakest,
+    positionsPerSide,
+    currentSymbols: currentSymbolsForExtreme(currentWeights, settings.mode, false),
+    strongestSide: false,
+    settings,
+  });
+  strongest = retainedStrongest.selected;
+  weakest = retainedWeakest.selected;
+  const selectionHysteresis = {
+    enabled: settings.selectionHysteresisEnabled,
+    retainedStrongestSymbols: retainedStrongest.retainedSymbols,
+    retainedWeakestSymbols: retainedWeakest.retainedSymbols,
+    retainedCount: retainedStrongest.retainedSymbols.length + retainedWeakest.retainedSymbols.length,
+    switchGaps: [...retainedStrongest.switchGaps, ...retainedWeakest.switchGaps],
+  };
   const dispersion = mean(strongest.map((item) => item.relativeReturn))
     - mean(weakest.map((item) => item.relativeReturn));
   const rawLeverage = settings.dynamicLeverageEnabled
@@ -336,18 +532,31 @@ export function calculateCrossSectionalWeights(
   const leverage = adaptiveRisk.enabled && !adaptiveRisk.stable
     ? Math.min(rawLeverage, settings.uncertainLeverageCap)
     : rawLeverage;
+  const longItems = settings.mode === 'momentum' ? strongest : weakest;
+  const shortItems = settings.mode === 'momentum' ? weakest : strongest;
+  const newsRiskScoresBySymbol = signalContext.newsRiskScoresBySymbol || {};
+  const newsRiskConflictSymbols = [
+    ...longItems.filter((item) => Number(newsRiskScoresBySymbol[item.symbol]) < 0),
+    ...shortItems.filter((item) => Number(newsRiskScoresBySymbol[item.symbol]) > 0),
+  ].map((item) => item.symbol);
+  const configuredNewsRiskScale = Number(signalContext.newsRiskGrossExposureScale);
+  const newsRiskGrossExposureScale = newsRiskConflictSymbols.length
+    && Number.isFinite(configuredNewsRiskScale)
+    ? Math.min(1, Math.max(0, configuredNewsRiskScale))
+    : 1;
+  const newsRiskVetoTriggered = newsRiskGrossExposureScale < 1;
   const requestedGrossExposure = Math.min(
     settings.maxGrossExposure,
     settings.baseGrossExposure * leverage,
-  ) * adaptiveRisk.grossExposureScale;
+  ) * adaptiveRisk.grossExposureScale
+    * selectedSpreadRisk.spreadRiskScale
+    * newsRiskGrossExposureScale;
   const uncappedSideWeight = requestedGrossExposure / 2 / positionsPerSide;
   const sideWeight = settings.maximumSingleAssetExposure == null
     ? uncappedSideWeight
     : Math.min(uncappedSideWeight, settings.maximumSingleAssetExposure);
   const grossExposure = sideWeight * positionsPerSide * 2;
   const weights = Object.fromEntries(symbols.map((symbol) => [symbol, 0]));
-  const longItems = settings.mode === 'momentum' ? strongest : weakest;
-  const shortItems = settings.mode === 'momentum' ? weakest : strongest;
   for (const item of longItems) weights[item.symbol] = sideWeight;
   for (const item of shortItems) weights[item.symbol] = -sideWeight;
   return {
@@ -356,6 +565,7 @@ export function calculateCrossSectionalWeights(
     grossExposure,
     ranking: ranked,
     newsAppliedSymbols: ranked.filter((item) => item.newsEligible).map((item) => item.symbol),
+    selectionHysteresis,
     adaptiveRisk: {
       ...adaptiveRisk,
       rawLeverage,
@@ -363,6 +573,19 @@ export function calculateCrossSectionalWeights(
       requestedGrossExposure,
       grossExposure,
       maximumSingleAssetExposure: sideWeight,
+      spreadRiskEnabled: selectedSpreadRisk.enabled,
+      selectedSpreadVolatility: selectedSpreadRisk.selectedSpreadVolatility,
+      spreadRiskScale: selectedSpreadRisk.spreadRiskScale,
+      spreadRiskScaled: selectedSpreadRisk.scaled,
+      spreadRiskTriggered: selectedSpreadRisk.triggered,
+      spreadRiskBasePositionsPerSide: basePositionsPerSide,
+      effectivePositionsPerSide: positionsPerSide,
+      selectionHysteresisEnabled: selectionHysteresis.enabled,
+      selectionHysteresisRetainedCount: selectionHysteresis.retainedCount,
+      newsRiskVetoEnabled: Object.keys(newsRiskScoresBySymbol).length > 0,
+      newsRiskVetoTriggered,
+      newsRiskGrossExposureScale,
+      newsRiskConflictSymbols,
     },
   };
 }
@@ -515,6 +738,14 @@ function summarize(
     averageSingleAssetExposure: round(mean(singleAssetExposures)),
     p95SingleAssetExposure: round(percentile(singleAssetExposures, 0.95)),
     maximumSingleAssetExposure: round(Math.max(...singleAssetExposures)),
+    spreadRiskScaledDays: adaptiveObservations.filter((item) => item.spreadRiskScaled).length,
+    spreadRiskTriggeredDays: adaptiveObservations.filter((item) => item.spreadRiskTriggered).length,
+    averageSpreadRiskScale: round(mean(adaptiveObservations.map(
+      (item) => item.spreadRiskScale ?? 1,
+    ))),
+    p95SelectedSpreadVolatility: round(percentile(adaptiveObservations
+      .map((item) => item.selectedSpreadVolatility)
+      .filter(Number.isFinite), 0.95)),
   };
 }
 
@@ -530,6 +761,7 @@ export function runCrossSectionalBacktest(seriesBySymbol, options = {}, referenc
     settings.lookbackDays,
     ...(settings.adaptiveBreadthEnabled ? settings.confirmationLookbackDays : []),
     settings.adaptiveBreadthEnabled ? settings.adaptiveVolatilityWindowDays : 0,
+    settings.spreadRiskEnabled ? settings.spreadVolatilityWindowDays : 0,
   );
   if (dates.length <= warmupDays + 2) throw new Error('行情长度不足');
 
@@ -545,7 +777,14 @@ export function runCrossSectionalBacktest(seriesBySymbol, options = {}, referenc
     stable: true,
     effectivePositionsPerSide: settings.positionsPerSide,
     highVolatility: false,
+    spreadRiskScale: 1,
+    spreadRiskScaled: false,
+    spreadRiskTriggered: false,
+    selectedSpreadVolatility: null,
+    selectionHysteresisRetainedCount: 0,
   };
+  let selectionHysteresisRetentionEvents = 0;
+  let selectionHysteresisRetainedLegs = 0;
   const resultDates = [];
   const dailyReturns = [];
   const equityCurve = [];
@@ -570,10 +809,16 @@ export function runCrossSectionalBacktest(seriesBySymbol, options = {}, referenc
     let proposedBaseWeights = baseWeights;
     let proposedLeverage = currentLeverage;
     if (lockReason === null && (scheduledRebalance || monthChanged)) {
-      const allocation = calculateCrossSectionalWeights(closesBySymbol, symbols, index, settings);
+      const allocation = calculateCrossSectionalWeights(closesBySymbol, symbols, index, settings, {
+        currentWeights: baseWeights,
+      });
       proposedBaseWeights = allocation.weights;
       proposedLeverage = allocation.leverage;
       currentAdaptiveRisk = allocation.adaptiveRisk;
+      if (allocation.selectionHysteresis.retainedCount > 0) {
+        selectionHysteresisRetentionEvents += 1;
+        selectionHysteresisRetainedLegs += allocation.selectionHysteresis.retainedCount;
+      }
     }
     const referenceObservation = calculateReferenceObservation({
       dates,
@@ -650,18 +895,22 @@ export function runCrossSectionalBacktest(seriesBySymbol, options = {}, referenc
     strategy: '横截面市场中性多空',
     settings,
     symbols,
-    metrics: summarize(
-      resultDates,
-      dailyReturns,
-      equityCurve,
-      turnovers,
-      grossExposures,
-      leverages,
-      lockStates,
-      referenceObservations,
-      adaptiveObservations,
-      singleAssetExposures,
-    ),
+    metrics: {
+      ...summarize(
+        resultDates,
+        dailyReturns,
+        equityCurve,
+        turnovers,
+        grossExposures,
+        leverages,
+        lockStates,
+        referenceObservations,
+        adaptiveObservations,
+        singleAssetExposures,
+      ),
+      selectionHysteresisRetentionEvents,
+      selectionHysteresisRetainedLegs,
+    },
     equityCurve: resultDates.map((date, index) => ({ date, equity: round(equityCurve[index]) })),
   };
 }
