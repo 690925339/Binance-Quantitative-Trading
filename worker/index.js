@@ -419,11 +419,15 @@ async function catalog(request, env) {
   return seededJson(request, env, 'strategy-catalog', { strategies: [], symbols: SYMBOLS.map((value) => ({ value, label: value })) });
 }
 
-function genericRisk(config = {}) {
+function genericRisk(config = {}, type = '') {
   const leverage = Math.min(125, Math.max(1, Number(config.leverage) || 1));
   const margin = Math.max(0, Number(config.marginBudget ?? config.maxInvestment ?? config.orderAmount) || 0);
-  const maximum = Math.round(margin * leverage * 100) / 100;
-  return { estimatedMaxInvestment: margin, estimatedMaxExposure: maximum, leverage, metrics: [{ label: '杠杆倍数', value: leverage, unit: '×' }, { label: '最大名义敞口', value: maximum, unit: 'USDT' }], warnings: ['线上版本仅用于策略配置、行情与模拟盘观察，不会自动下单。'] };
+  const leverageCapacity = margin * leverage;
+  const strategyCap = type === 'btcSingleAssetTrend'
+    ? margin * Math.max(0, Number(config.maxGrossExposurePercent || 0)) / 100
+    : leverageCapacity;
+  const maximum = Math.round(Math.min(leverageCapacity, strategyCap) * 100) / 100;
+  return { estimatedMaxInvestment: margin, estimatedMaxExposure: maximum, leverage, metrics: [{ label: '杠杆倍数', value: leverage, unit: '×' }, { label: '最大名义敞口', value: maximum, unit: 'USDT' }], warnings: [type === 'btcSingleAssetTrend' ? 'BTC单币策略仅用于独立模拟盘，不替换组合策略，也不会自动下单。' : '线上版本仅用于策略配置、行情与模拟盘观察，不会自动下单。'] };
 }
 
 async function parseBody(request) {
@@ -444,8 +448,9 @@ async function createStrategy(request, env) {
   const name = String(input.name || '').trim();
   const symbol = validSymbol(input.symbol);
   if (!type || name.length < 2 || name.length > 40) throw httpError('策略名称需为 2 到 40 个字符');
+  if (type === 'btcSingleAssetTrend' && symbol !== 'BTCUSDT') throw httpError('BTC单币策略只允许 BTCUSDT');
   const now = new Date().toISOString();
-  const strategy = { id: crypto.randomUUID(), type, name, symbol, enabled: false, config: input.config || {}, riskSummary: genericRisk(input.config), createdAt: now, updatedAt: now };
+  const strategy = { id: crypto.randomUUID(), type, name, symbol, enabled: false, config: input.config || {}, riskSummary: genericRisk(input.config, type), createdAt: now, updatedAt: now };
   await ensureSchema(env);
   await env.DB.prepare('INSERT INTO strategy_records (id, payload, created_at, updated_at) VALUES (?, ?, ?, ?)').bind(strategy.id, JSON.stringify(strategy), now, now).run();
   return strategy;
@@ -460,7 +465,8 @@ async function updateStrategy(request, env, id, patch) {
   next.name = String(next.name || '').trim();
   next.symbol = validSymbol(next.symbol);
   if (next.name.length < 2 || next.name.length > 40) throw httpError('策略名称需为 2 到 40 个字符');
-  next.riskSummary = genericRisk(next.config);
+  if (next.type === 'btcSingleAssetTrend' && next.symbol !== 'BTCUSDT') throw httpError('BTC单币策略只允许 BTCUSDT');
+  next.riskSummary = genericRisk(next.config, next.type);
   await env.DB.prepare('UPDATE strategy_records SET payload = ?, updated_at = ? WHERE id = ?').bind(JSON.stringify(next), next.updatedAt, id).run();
   return next;
 }
@@ -559,7 +565,14 @@ async function api(request, env, url) {
     const source = JSON.parse(row.payload);
     return json({ strategy: await createStrategy(new Request(request.url, { method: 'POST', body: JSON.stringify({ ...source, name: `${source.name} 副本`, enabled: false }) }), env) }, 201);
   }
-  if (request.method === 'GET' && url.pathname === '/api/paper-portfolio') return json(await readState(request, env, 'paper-portfolio', 'paper-portfolio', { status: 'not_started', reports: [], positions: [] }));
+  if (request.method === 'GET' && url.pathname === '/api/paper-portfolio') {
+    const [paper, btcPortfolio] = await Promise.all([
+      readState(request, env, 'paper-portfolio', 'paper-portfolio', { status: 'not_started', reports: [], positions: [] }),
+      readState(request, env, 'btc-paper', 'btc-paper', { status: 'not_started', reports: [], positions: [], strategyType: 'btcSingleAssetTrend' }),
+    ]);
+    return json({ ...paper, btcPortfolio });
+  }
+  if (request.method === 'GET' && url.pathname === '/api/paper-portfolio/btc') return json(await readState(request, env, 'btc-paper', 'btc-paper', { status: 'not_started', reports: [], positions: [], strategyType: 'btcSingleAssetTrend' }));
   if (request.method === 'GET' && url.pathname === '/api/paper-portfolio/review') return json(await readState(request, env, 'paper-review', 'paper-review', { status: 'not_started', candidates: [] }));
   if (request.method === 'GET' && url.pathname === '/api/paper-portfolio/reports') {
     const limit = Number(url.searchParams.get('limit') || 30);

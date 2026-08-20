@@ -344,7 +344,67 @@ function paperCandidateStatus(status) {
   }[status] || status || '--';
 }
 
+function renderBtcPaperPortfolio(paper) {
+  if (!$('#btcPaperCard')) return;
+  const running = paper?.status === 'running';
+  $('#btcPaperStatus').textContent = running ? '独立运行中' : '尚未启动';
+  $('#btcPaperStatus').classList.toggle('running', running);
+  if (!running) {
+    $('#btcPaperUpdatedAt').textContent = '等待建立模拟仓';
+    $('#btcPaperEquity').textContent = '--';
+    $('#btcPaperPnl').textContent = '累计 --';
+    $('#btcPaperPnl').className = 'neutral';
+    $('#btcPaperSignal').textContent = '--';
+    $('#btcPaperPosition').textContent = '--';
+    $('#btcPaperLeverage').textContent = '--';
+    $('#btcPaperRisk').textContent = '--';
+    $('#btcPaperNews').textContent = '--';
+    $('#btcPaperReports').innerHTML = '<div class="empty-state"><span>₿</span><strong>BTC模拟盘尚未启动</strong><p>每日任务会使用实时进场价建立独立账本</p></div>';
+    return;
+  }
+  const position = paper.positions?.[0] || null;
+  const signal = paper.signal || paper.latestReport?.signal || null;
+  const newsRisk = paper.newsRisk || paper.latestReport?.newsRisk || null;
+  const deRisk = paper.profitDeRisk || paper.latestReport?.profitDeRisk || null;
+  $('#btcPaperUpdatedAt').textContent = `更新于 ${beijingTime(paper.updatedAt || paper.latestReport?.reportedAt)}`;
+  $('#btcPaperEquity').textContent = `${Number(paper.equity).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT`;
+  $('#btcPaperPnl').textContent = `累计 ${formatPnl(paper.totalPnl)} · ${percentFormat(paper.totalReturn)}`;
+  $('#btcPaperPnl').className = pnlClass(paper.totalPnl);
+  $('#btcPaperSignal').textContent = signal?.direction === 'LONG'
+    ? '趋势偏多'
+    : signal?.direction === 'SHORT'
+      ? '趋势偏空'
+      : '趋势观望';
+  $('#btcPaperPosition').textContent = position
+    ? `${position.side === 'LONG' ? '多仓' : '空仓'} ${Math.abs(Number(position.weightPercent)).toFixed(2)}%`
+    : paper.lockReason === 'loss'
+      ? '亏损保护空仓'
+      : '信号空仓';
+  $('#btcPaperLeverage').textContent = signal
+    ? `${Number(signal.dynamicLeverage || 1).toFixed(2)}×（实际敞口 ${percentFormat(paper.modelGrossExposure)}）`
+    : '--';
+  $('#btcPaperRisk').textContent = paper.lockReason === 'loss'
+    ? '1.5%月度亏损保护已触发'
+    : deRisk?.active
+      ? '月收益达1%，保留10%敞口'
+      : `正常运行 · 月内 ${percentFormat(paper.monthlyReturn)}`;
+  $('#btcPaperNews').textContent = newsRisk?.conflict
+    ? `可信冲突，敞口降至${Number(newsRisk.appliedGrossExposureScale * 100).toFixed(0)}%`
+    : newsRisk?.eligible
+      ? `${newsRisk.direction === 'bullish' ? '利多' : '利空'}证据合格，无持仓冲突`
+      : '未形成合格的BTC专属事件证据';
+  const reports = (paper.reports || []).slice(-3).reverse();
+  $('#btcPaperReports').innerHTML = reports.map((report) => `
+    <article>
+      <span>${escapeHtml(report.cycleDate)} · ${report.kind === 'initialization' ? '建仓基线' : '09:00日报'}</span>
+      <b class="${pnlClass(report.dayPnl)}">${formatPnl(report.dayPnl)} · ${percentFormat(report.dayReturn)}</b>
+      <small>BTC ${percentFormat(report.assetReturn)} · 成本 ${Number((report.tradingCost || 0) + (report.carryCost || 0)).toFixed(2)} USDT</small>
+    </article>
+  `).join('');
+}
+
 function renderPaperPortfolio(paper) {
+  renderBtcPaperPortfolio(paper?.btcPortfolio);
   const running = paper.status === 'running';
   $('#paperStatus').textContent = running ? '模拟运行中' : '尚未启动';
   $('#paperStatus').classList.toggle('running', running);
@@ -612,6 +672,18 @@ function localRiskPreview(type, config) {
           : '该策略需要 USDⓈ-M 合约执行器；当前仅保存配置和生成风险摘要。';
     }
   }
+  if (type === 'btcSingleAssetTrend') {
+    metrics = [
+      { label: '唯一标的', value: 'BTCUSDT', unit: '' },
+      { label: '趋势周期', value: `${config.shortLookbackDays} / ${config.mediumLookbackDays} / ${config.longLookbackDays}`, unit: '天' },
+      { label: '目标年化波动', value: config.targetVolatilityPercent, unit: '%' },
+      { label: '最大BTC敞口', value: config.maxGrossExposurePercent, unit: '%' },
+      { label: '历史验证年化 / 回撤', value: '3.84 / -9.30', unit: '%' },
+    ];
+    warning = !(config.shortLookbackDays < config.mediumLookbackDays && config.mediumLookbackDays < config.longLookbackDays)
+      ? '回看周期必须满足短周期 < 中周期 < 长周期。'
+      : '该策略只持有BTC，历史验证仅10/18个盈利月；当前只开独立模拟仓，不替换组合盘。';
+  }
   if (type === 'monthlyAccuracyPortfolio') {
     metrics = [
       { label: '市场中性 / 趋势权重', value: `${config.marketNeutralWeightPercent} / ${config.trendWeightPercent}`, unit: '%' },
@@ -664,7 +736,7 @@ function localRiskPreview(type, config) {
     { label: '杠杆倍数', value: leverage, unit: '×' },
     {
       label: '最大名义敞口',
-      value: ['longShortTrend', 'longShortEnhanced', 'longShortHighReturn', 'monthlyAccuracyPortfolio', 'stableComposite', 'aggressiveComposite'].includes(type)
+      value: ['longShortTrend', 'longShortEnhanced', 'longShortHighReturn', 'monthlyAccuracyPortfolio', 'btcSingleAssetTrend', 'stableComposite', 'aggressiveComposite'].includes(type)
         ? Math.min(
           maxInvestment * leverage,
           maxInvestment * config.maxGrossExposurePercent / 100

@@ -22,6 +22,14 @@ import {
   paperShadowStatePath,
   writePaperReviewArtifacts,
 } from '../src/paper-strategy-review.js';
+import {
+  advanceBtcPaperState,
+  btcPaperSnapshot,
+  btcPaperStatePath,
+  BTC_SINGLE_ASSET_PAPER_PROFILE,
+  initializeBtcPaperState,
+  writeBtcPaperReportArtifacts,
+} from '../src/btc-paper.js';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const stateFile = path.join(rootDir, 'data', 'runtime', 'monthly-accuracy-paper.json');
@@ -165,7 +173,7 @@ function signed(value, digits = 2) {
   return `${number > 0 ? '+' : ''}${number.toFixed(digits)}`;
 }
 
-function reportText(state, review) {
+function reportText(state, review, btcState = null) {
   const report = state.latestReport;
   const attribution = review?.latestAttribution;
   const candidateSummary = (review?.candidates || [])
@@ -188,8 +196,28 @@ function reportText(state, review) {
       `最大拖累：${attribution.largestDetractor.symbol} ${signed(attribution.largestDetractor.totalPricePnl)} USDT`,
     ] : []),
     ...(candidateSummary ? [`影子策略：${candidateSummary}`] : []),
+    ...(btcState?.latestReport ? [
+      `BTC单币盘：${btcState.positions.length
+        ? `${btcState.positions[0].side === 'LONG' ? '多' : '空'} ${Math.abs(btcState.positions[0].weightPercent).toFixed(2)}%`
+        : '空仓'}；净值 ${Number(btcState.equity).toFixed(2)} USDT；累计 ${signed(btcState.equity - btcState.initialCapital)} USDT`,
+    ] : []),
   ];
   return lines.join('\n');
+}
+
+export async function fetchBtcLivePrice({
+  fetchImpl = fetch,
+  baseUrl = 'https://data-api.binance.vision',
+} = {}) {
+  const response = await fetchImpl(`${baseUrl}/api/v3/ticker/price?symbol=BTCUSDT`, {
+    signal: AbortSignal.timeout(15_000),
+  });
+  const payload = await response.json().catch(() => null);
+  const price = Number(payload?.price);
+  if (!response.ok || !Number.isFinite(price) || price <= 0) {
+    throw new Error(`BTC实时价格返回异常：${response.status} ${payload?.msg || ''}`.trim());
+  }
+  return price;
 }
 
 function notifyWindows(message) {
@@ -319,13 +347,72 @@ export async function runPaperDaily({
     });
   })));
   const [state, ...shadowStates] = states;
+  const btcStore = new PaperPortfolioStore(btcPaperStatePath(rootDir));
+  const existingBtcState = await btcStore.read();
+  const btcPending = !existingBtcState || existingBtcState.lastCycleDate < latestCycleDate;
+  let btcMarketData = null;
+  const btcNewsSnapshotsByCycleDate = {};
+  let btcEntryPrice = null;
+  if (btcPending) {
+    const btcMarkStartCycleDate = existingBtcState
+      ? addUtcDays(existingBtcState.lastCycleDate, 1)
+      : latestCycleDate;
+    btcMarketData = await fetchPaperMarketData({
+      historyStartDate: addUtcDays(existingBtcState?.startCycleDate || latestCycleDate, -220),
+      signalEndDate: addUtcDays(latestCycleDate, -1),
+      markStartCycleDate: btcMarkStartCycleDate,
+      markEndCycleDate: latestCycleDate,
+      fetchImpl,
+      symbols: [BTC_SINGLE_ASSET_PAPER_PROFILE.symbol],
+      ...(baseUrl ? { baseUrl } : {}),
+    });
+    for (let cycleDate = btcMarkStartCycleDate; cycleDate <= latestCycleDate; cycleDate = addUtcDays(cycleDate, 1)) {
+      btcNewsSnapshotsByCycleDate[cycleDate] = newsSnapshotsByCycleDate[cycleDate]
+        || await readPaperNewsSnapshot(cycleDate)
+        || null;
+    }
+    if (!existingBtcState) {
+      btcEntryPrice = await fetchBtcLivePrice({
+        fetchImpl,
+        ...(baseUrl ? { baseUrl } : {}),
+      });
+    }
+  }
+  const btcState = await btcStore.run((storedState) => {
+    if (storedState && storedState.lastCycleDate >= latestCycleDate) return storedState;
+    if (!btcMarketData) throw new Error('BTC模拟盘缺少待结算行情');
+    if (!storedState) {
+      return initializeBtcPaperState({
+        seriesBySymbol: btcMarketData.seriesBySymbol,
+        cycleDate: latestCycleDate,
+        markPrice: btcEntryPrice,
+        initialCapital,
+        now,
+        newsSnapshot: btcNewsSnapshotsByCycleDate[latestCycleDate],
+        entryMode: 'live_mark',
+      });
+    }
+    return advanceBtcPaperState({
+      state: storedState,
+      seriesBySymbol: btcMarketData.seriesBySymbol,
+      markPricesByCycleDate: btcMarketData.markPricesByCycleDate,
+      throughCycleDate: latestCycleDate,
+      now,
+      newsSnapshotsByCycleDate: btcNewsSnapshotsByCycleDate,
+    });
+  });
   await writePaperReportArtifacts(rootDir, state);
+  await writeBtcPaperReportArtifacts(rootDir, btcState);
   const review = buildPaperStrategyReview({ baselineState: state, shadowStates, now });
   await writePaperReviewArtifacts(rootDir, review);
-  const text = reportText(state, review);
+  const text = reportText(state, review, btcState);
   console.log(text);
   if (notify) notifyWindows(text);
-  return { ...paperPortfolioSnapshot(state), optimizationReview: review };
+  return {
+    ...paperPortfolioSnapshot(state),
+    optimizationReview: review,
+    btcPortfolio: btcPaperSnapshot(btcState),
+  };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

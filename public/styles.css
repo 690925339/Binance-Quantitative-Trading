@@ -394,6 +394,21 @@ fieldset { padding: 0; border: 0; margin: 0; }
 .paper-equity-card > header small { margin-top: 3px; color: var(--muted-2); font-size: 7px; }
 .paper-refresh-button { border: 1px solid var(--line); padding: 7px 9px; color: var(--muted); border-radius: 8px; background: var(--surface-soft); font-size: 8px; }
 .paper-equity-card > strong { display: block; margin-top: 17px; font-size: 28px; font-variant-numeric: tabular-nums; }
+.btc-paper-title { align-items: center; }
+.btc-paper-card { padding: 15px; border-color: rgba(247, 147, 26, .24); background: linear-gradient(155deg, rgba(247, 147, 26, .07), var(--surface) 46%); }
+.btc-paper-card > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.btc-paper-card > header strong, .btc-paper-card > header small { display: block; }
+.btc-paper-card > header strong { font-size: 11px; }
+.btc-paper-card > header small { margin-top: 4px; color: var(--muted-2); font-size: 7px; }
+.btc-paper-card > header > b { color: #f7931a; font-size: 10px; }
+.btc-paper-equity { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-top: 16px; }
+.btc-paper-equity > strong { font-size: 23px; font-variant-numeric: tabular-nums; }
+.btc-paper-equity > span { font-size: 9px; font-weight: 700; }
+.btc-paper-reports { display: grid; gap: 7px; margin-top: 13px; }
+.btc-paper-reports article { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 9px 10px; border-radius: 9px; background: var(--surface-soft); }
+.btc-paper-reports span { color: var(--muted); font-size: 7px; }
+.btc-paper-reports b { font-size: 9px; text-align: right; }
+.btc-paper-reports small { grid-column: 1 / -1; color: var(--muted-2); font-size: 7px; }
 .paper-day-pnl { display: inline-block; margin-top: 6px; padding: 5px 8px; border-radius: 7px; color: var(--muted); background: var(--surface-soft); font-size: 9px; font-weight: 700; }
 .paper-day-pnl.positive { color: var(--positive); background: var(--positive-soft); }
 .paper-day-pnl.negative { color: var(--negative); background: var(--negative-soft); }

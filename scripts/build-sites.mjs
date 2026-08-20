@@ -33,4 +33,8 @@ await copyIfPresent(
   path.join(rootDir, 'data', 'runtime', 'paper-review.json'),
   path.join(seedDir, 'paper-review.json'),
 );
+await copyIfPresent(
+  path.join(rootDir, 'data', 'runtime', 'btc-single-asset-paper.json'),
+  path.join(seedDir, 'btc-paper.json'),
+);
 console.log('Sites Worker artifact ready.');

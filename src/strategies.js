@@ -15,6 +15,7 @@ const SYMBOL_OPTIONS = [
 
 const LONG_SHORT_STRATEGY_TYPES = ['longShortTrend', 'longShortEnhanced', 'longShortHighReturn'];
 const MONTHLY_ACCURACY_STRATEGY_TYPE = 'monthlyAccuracyPortfolio';
+const BTC_SINGLE_ASSET_STRATEGY_TYPE = 'btcSingleAssetTrend';
 
 const leverageField = (overrides = {}) => ({
   key: 'leverage',
@@ -126,6 +127,26 @@ const monthlyAccuracyFields = () => [
     default: 2,
     help: '只提供不超过 3× 的保证金容量；85/15冻结组合理论总绝对敞口约为净值的142.5%，配置上限取143%。',
   }),
+];
+
+const btcSingleAssetFields = () => [
+  { key: 'positionMode', label: '交易方向', type: 'select', default: 'both', options: [
+    { value: 'both', label: '双向（做多 / 做空）' },
+    { value: 'longOnly', label: '仅做多' },
+    { value: 'shortOnly', label: '仅做空' },
+  ] },
+  { key: 'shortLookbackDays', label: '短周期回看', type: 'number', unit: '天', min: 5, max: 120, step: 1, integer: true, default: 45 },
+  { key: 'mediumLookbackDays', label: '中周期回看', type: 'number', unit: '天', min: 10, max: 240, step: 1, integer: true, default: 90 },
+  { key: 'longLookbackDays', label: '长周期回看', type: 'number', unit: '天', min: 20, max: 365, step: 1, integer: true, default: 180 },
+  { key: 'targetVolatilityPercent', label: '目标年化波动', type: 'number', unit: '%', min: 2, max: 30, step: 0.5, default: 10 },
+  { key: 'maxGrossExposurePercent', label: 'BTC最大敞口', type: 'number', unit: '%', min: 10, max: 100, step: 1, default: 100 },
+  { key: 'minimumTrendStrengthPercent', label: '最小趋势强度', type: 'number', unit: '%', min: 0, max: 20, step: 0.1, default: 2 },
+  { key: 'monthlyLossLimitPercent', label: '月度亏损保护', type: 'number', unit: '%', min: 0.5, max: 20, step: 0.1, default: 1.5 },
+  { key: 'monthlyProfitDeRiskThresholdPercent', label: '月内降风险阈值', type: 'number', unit: '%', min: 0.5, max: 20, step: 0.1, default: 1 },
+  { key: 'monthlyProfitDeRiskScalePercent', label: '达标后保留敞口', type: 'number', unit: '%', min: 5, max: 100, step: 1, default: 10 },
+  { key: 'newsConflictScalePercent', label: '可信新闻冲突后敞口', type: 'number', unit: '%', min: 10, max: 100, step: 1, default: 75 },
+  { key: 'marginBudget', label: '模拟本金', type: 'number', unit: 'USDT', min: 10, max: 10_000_000, step: 0.01, default: 10_000 },
+  leverageField({ max: 3, default: 2, help: '动态风险预算上限为3×，实际BTC名义敞口仍限制在模拟净值的100%以内。' }),
 ];
 
 export const STRATEGY_CATALOG = {
@@ -243,6 +264,16 @@ export const STRATEGY_CATALOG = {
     portfolio: true,
     universe: SYMBOL_OPTIONS.map((item) => item.value),
     fields: monthlyAccuracyFields(),
+  },
+  btcSingleAssetTrend: {
+    type: BTC_SINGLE_ASSET_STRATEGY_TYPE,
+    name: 'BTC单币动态多空',
+    icon: '₿',
+    riskLevel: '高风险实验型',
+    description: '只持有BTCUSDT，沿用多周期趋势、动态风险预算、亏损保护和可信新闻冲突减仓。',
+    portfolio: true,
+    universe: ['BTCUSDT'],
+    fields: btcSingleAssetFields(),
   },
   stableComposite: {
     type: 'stableComposite',
@@ -391,6 +422,18 @@ function estimateRisk(type, config) {
     warnings.push('验证区间已被多轮研究观察，正式使用前至少需要新的前向纸面交易期；当前仍然不会自动下单。');
     warnings.push('市场中性是名义金额中性，不等于完全没有市场、资金费率、基差、流动性或多腿成交风险。');
   }
+  if (type === BTC_SINGLE_ASSET_STRATEGY_TYPE) {
+    estimatedMaxInvestment = config.marginBudget;
+    metrics = [
+      { label: '唯一标的', value: 'BTCUSDT', unit: '' },
+      { label: '趋势周期', value: `${config.shortLookbackDays} / ${config.mediumLookbackDays} / ${config.longLookbackDays}`, unit: '天' },
+      { label: '动态风险预算', value: `1 - ${config.leverage}`, unit: '×' },
+      { label: '月度亏损保护', value: config.monthlyLossLimitPercent, unit: '%' },
+      { label: '历史验证年化', value: 3.84, unit: '%' },
+      { label: '历史验证最大回撤', value: -9.30, unit: '%' },
+    ];
+    warnings.push('单币策略没有横截面分散；历史验证仅10/18个盈利月、年化3.84%，当前只进入独立模拟盘，不替换组合策略。');
+  }
   if (['stableComposite', 'aggressiveComposite'].includes(type)) {
     estimatedMaxInvestment = config.marginBudget;
     metrics = [
@@ -412,7 +455,7 @@ function estimateRisk(type, config) {
   const conditionalExposureMultiplier = type === 'stableComposite' && config.accuracyLeverageEnabled === 'enabled'
     ? config.accuracyLeverageMultiplier
     : 1;
-  const strategyExposureCap = [...LONG_SHORT_STRATEGY_TYPES, MONTHLY_ACCURACY_STRATEGY_TYPE, 'stableComposite', 'aggressiveComposite'].includes(type)
+  const strategyExposureCap = [...LONG_SHORT_STRATEGY_TYPES, MONTHLY_ACCURACY_STRATEGY_TYPE, BTC_SINGLE_ASSET_STRATEGY_TYPE, 'stableComposite', 'aggressiveComposite'].includes(type)
     ? estimatedMaxInvestment * config.maxGrossExposurePercent / 100 * conditionalExposureMultiplier
     : leverageCapacity;
   const estimatedMaxExposure = round(Math.min(leverageCapacity, strategyExposureCap));
@@ -461,6 +504,13 @@ export function validateStrategyInput(input) {
     }
     if (config.maxAssetExposurePercent > config.maxGrossExposurePercent) {
       throw new StrategyValidationError('单币最大敞口不能超过组合最大总敞口');
+    }
+  }
+  if (type === BTC_SINGLE_ASSET_STRATEGY_TYPE) {
+    if (symbol !== 'BTCUSDT') throw new StrategyValidationError('BTC单币策略只允许 BTCUSDT');
+    if (!(config.shortLookbackDays < config.mediumLookbackDays
+      && config.mediumLookbackDays < config.longLookbackDays)) {
+      throw new StrategyValidationError('BTC趋势回看周期必须满足短周期 < 中周期 < 长周期');
     }
   }
   if (type === MONTHLY_ACCURACY_STRATEGY_TYPE

@@ -63,6 +63,7 @@ test('未登录进入登录页，登录后首页包含移动端视口和模拟�
   assert.match(html, /id="paperPage"/);
   assert.match(html, /id="paperAttribution"/);
   assert.match(html, /id="paperCandidateList"/);
+  assert.match(html, /id="btcPaperCard"/);
 });
 
 test('系统登录与测试网 API 会话使用独立保护', async () => {
@@ -81,13 +82,13 @@ test('拒绝无效交易对格式', async () => {
   assert.match((await response.json()).error, /交易对格式/);
 });
 
-test('策略目录包含十类可配置策略且明确不自动下单', async () => {
+test('策略目录包含BTC单币在内的十一类可配置策略且明确不自动下单', async () => {
   const response = await authFetch('/api/strategies/catalog');
   const payload = await response.json();
   assert.equal(response.status, 200);
   assert.equal(payload.executionMode, 'CONFIG_ONLY');
   assert.deepEqual(payload.strategies.map((item) => item.type), [
-    'grid', 'martingale', 'dca', 'maCrossover', 'longShortTrend', 'longShortEnhanced', 'longShortHighReturn', 'monthlyAccuracyPortfolio', 'stableComposite', 'aggressiveComposite',
+    'grid', 'martingale', 'dca', 'maCrossover', 'longShortTrend', 'longShortEnhanced', 'longShortHighReturn', 'monthlyAccuracyPortfolio', 'btcSingleAssetTrend', 'stableComposite', 'aggressiveComposite',
   ]);
   assert.ok(payload.strategies.every((item) => item.fields.length > 0));
   const longShortTrend = payload.strategies.find((item) => item.type === 'longShortTrend');
@@ -104,6 +105,9 @@ test('策略目录包含十类可配置策略且明确不自动下单', async ()
   assert.equal(monthlyAccuracy.portfolio, true);
   assert.equal(monthlyAccuracy.fields.find((item) => item.key === 'marketNeutralWeightPercent').default, 85);
   assert.equal(monthlyAccuracy.fields.find((item) => item.key === 'maxGrossExposurePercent').default, 143);
+  const btcSingle = payload.strategies.find((item) => item.type === 'btcSingleAssetTrend');
+  assert.deepEqual(btcSingle.universe, ['BTCUSDT']);
+  assert.equal(btcSingle.fields.find((item) => item.key === 'shortLookbackDays').default, 45);
   assert.equal(payload.strategies.find((item) => item.type === 'stableComposite').riskLevel, '稳健型');
   assert.equal(
     payload.strategies.find((item) => item.type === 'stableComposite').fields
@@ -120,6 +124,11 @@ test('模拟盘接口无需测试网会话且日报数量参数受限', async ()
   assert.equal(payload.mode, 'PAPER');
   assert.equal(payload.strategyType, 'monthlyAccuracyPortfolio');
   assert.equal(payload.optimizationReview.baseline.frozen, true);
+  assert.equal(payload.btcPortfolio.strategyType, 'btcSingleAssetTrend');
+
+  const btc = await authFetch('/api/paper-portfolio/btc');
+  assert.equal(btc.status, 200);
+  assert.equal((await btc.json()).strategyType, 'btcSingleAssetTrend');
 
   const review = await authFetch('/api/paper-portfolio/review');
   assert.equal(review.status, 200);

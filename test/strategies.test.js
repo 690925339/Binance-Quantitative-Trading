@@ -17,13 +17,26 @@ function defaults(type, overrides = {}) {
   };
 }
 
-test('十类基础策略默认参数均可通过校验并生成风险摘要', () => {
-  for (const type of ['grid', 'martingale', 'dca', 'maCrossover', 'longShortTrend', 'longShortEnhanced', 'longShortHighReturn', 'monthlyAccuracyPortfolio', 'stableComposite', 'aggressiveComposite']) {
+test('十一类基础策略默认参数均可通过校验并生成风险摘要', () => {
+  for (const type of ['grid', 'martingale', 'dca', 'maCrossover', 'longShortTrend', 'longShortEnhanced', 'longShortHighReturn', 'monthlyAccuracyPortfolio', 'btcSingleAssetTrend', 'stableComposite', 'aggressiveComposite']) {
     const strategy = validateStrategyInput(defaults(type));
     assert.equal(strategy.type, type);
     assert.ok(strategy.riskSummary.estimatedMaxInvestment > 0);
     assert.ok(strategy.riskSummary.metrics.length >= 2);
   }
+});
+
+test('BTC单币策略固定BTC并披露独立模拟风险', () => {
+  const strategy = validateStrategyInput(defaults('btcSingleAssetTrend'));
+  assert.equal(strategy.symbol, 'BTCUSDT');
+  assert.equal(strategy.config.shortLookbackDays, 45);
+  assert.equal(strategy.config.leverage, 2);
+  assert.equal(strategy.riskSummary.estimatedMaxExposure, 10_000);
+  assert.match(strategy.riskSummary.warnings.join(' '), /10\/18个盈利月/);
+  assert.throws(
+    () => validateStrategyInput({ ...defaults('btcSingleAssetTrend'), symbol: 'ETHUSDT' }),
+    /只允许 BTCUSDT/,
+  );
 });
 
 test('90% 盈利月组合固定准确率优先权重并限制杠杆不超过 3 倍', () => {

@@ -211,12 +211,36 @@
             </div>
           </section>
 
+          <div class="section-title strategy-section-title btc-paper-title">
+            <div><p class="eyebrow">BTC ONLY PAPER</p><h2>BTC单币模拟盘</h2></div>
+            <span class="paper-status-badge" id="btcPaperStatus">读取中</span>
+          </div>
+          <section class="card btc-paper-card" id="btcPaperCard">
+            <header>
+              <div><strong>BTC动态多空</strong><small id="btcPaperUpdatedAt">等待建立模拟仓</small></div>
+              <b id="btcPaperSignal">--</b>
+            </header>
+            <div class="btc-paper-equity">
+              <strong id="btcPaperEquity">--</strong>
+              <span class="neutral" id="btcPaperPnl">累计 --</span>
+            </div>
+            <div class="paper-stat-grid">
+              <div><span>当前仓位</span><b id="btcPaperPosition">--</b></div>
+              <div><span>动态杠杆</span><b id="btcPaperLeverage">--</b></div>
+              <div><span>月内风险状态</span><b id="btcPaperRisk">--</b></div>
+              <div><span>新闻风险</span><b id="btcPaperNews">--</b></div>
+            </div>
+            <div class="btc-paper-reports" id="btcPaperReports">
+              <div class="empty-state"><span>₿</span><strong>等待首个模拟仓</strong><p>只交易BTCUSDT，不会调用真实下单接口</p></div>
+            </div>
+          </section>
+
           <div class="section-title strategy-section-title">
             <div><p class="eyebrow">REVIEW &amp; CHALLENGERS</p><h2>归因复盘与影子优化</h2></div>
           </div>
           <section class="card paper-review-card">
             <header>
-              <div><strong>当前版本参数已固定</strong><span>取消盈利锁后按实际信号运行；候选不会自动替换或加杠杆</span></div>
+              <div><strong>当前版本参数已固定</strong><span>组合盘与BTC单币盘独立记账；候选不会自动替换或加杠杆</span></div>
               <b id="paperReviewCycle">--</b>
             </header>
             <div class="paper-attribution" id="paperAttribution">

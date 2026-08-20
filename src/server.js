@@ -8,6 +8,7 @@ import { SignalAccuracyStore } from './accuracy-leverage.js';
 import { calculateCompositeSignal, calculatePriceTrendScore, COMPOSITE_STRATEGY_PROFILES } from './composite-strategies.js';
 import { NewsService } from './news-service.js';
 import { PaperPortfolioStore, paperPortfolioSnapshot } from './monthly-accuracy-paper.js';
+import { btcPaperSnapshot, btcPaperStatePath } from './btc-paper.js';
 import {
   buildPaperStrategyReview,
   PAPER_SHADOW_PROFILES,
@@ -28,6 +29,7 @@ const signalAccuracyStore = new SignalAccuracyStore(path.join(rootDir, 'data', '
 const paperPortfolioStore = new PaperPortfolioStore(
   path.join(rootDir, 'data', 'runtime', 'monthly-accuracy-paper.json'),
 );
+const btcPaperPortfolioStore = new PaperPortfolioStore(btcPaperStatePath(rootDir));
 const paperShadowStores = PAPER_SHADOW_PROFILES.map((profile) => (
   new PaperPortfolioStore(paperShadowStatePath(rootDir, profile.id))
 ));
@@ -255,13 +257,15 @@ function rateLimited(req) {
 }
 
 async function currentPaperPortfolio() {
-  const [baselineState, ...shadowStates] = await Promise.all([
+  const [baselineState, btcState, shadowStates] = await Promise.all([
     paperPortfolioStore.read(),
-    ...paperShadowStores.map((store) => store.read()),
+    btcPaperPortfolioStore.read(),
+    Promise.all(paperShadowStores.map((store) => store.read())),
   ]);
   return {
     ...paperPortfolioSnapshot(baselineState),
     optimizationReview: buildPaperStrategyReview({ baselineState, shadowStates }),
+    btcPortfolio: btcPaperSnapshot(btcState),
   };
 }
 
@@ -380,6 +384,10 @@ async function apiRoute(req, res, url, appContext) {
 
   if (req.method === 'GET' && url.pathname === '/api/paper-portfolio') {
     return sendJson(res, 200, await currentPaperPortfolio());
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/paper-portfolio/btc') {
+    return sendJson(res, 200, btcPaperSnapshot(await btcPaperPortfolioStore.read()));
   }
 
   if (req.method === 'GET' && url.pathname === '/api/paper-portfolio/review') {
