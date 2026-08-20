@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#0b0c0e">
+    <meta name="description" content="QuantFlow 后台用户管理">
+    <title>用户管理 · QuantFlow</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/admin.css?v=20260812-auth">
+  </head>
+  <body>
+    <div class="admin-shell">
+      <aside class="admin-sidebar">
+        <a class="admin-brand" href="/" aria-label="返回 QuantFlow">
+          <span class="admin-brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+          <span>Quant<b>Flow</b></span>
+        </a>
+        <nav aria-label="后台导航">
+          <a class="active" href="/admin.html"><span>◎</span>用户管理</a>
+          <a href="/"><span>↗</span>返回交易台</a>
+        </nav>
+        <div class="sidebar-account">
+          <span id="adminAvatar">管</span>
+          <div><strong id="adminName">管理员</strong><small id="adminUsername">--</small></div>
+        </div>
+      </aside>
+
+      <main class="admin-main">
+        <header class="admin-topbar">
+          <div><p>ADMINISTRATION</p><h1>用户管理</h1></div>
+          <div class="topbar-actions">
+            <button class="secondary-button" id="logoutButton" type="button">退出登录</button>
+            <button class="primary-button" id="openCreateUser" type="button">新增用户</button>
+          </div>
+        </header>
+
+        <section class="admin-content">
+          <div class="metric-grid" aria-label="用户统计">
+            <article><span>用户总数</span><strong id="totalUsers">--</strong><small>全部系统账号</small></article>
+            <article><span>启用账号</span><strong id="activeUsers">--</strong><small>当前可正常登录</small></article>
+            <article><span>管理员</span><strong id="adminUsers">--</strong><small>具有后台权限</small></article>
+            <article><span>停用账号</span><strong id="disabledUsers">--</strong><small>已阻止登录</small></article>
+          </div>
+
+          <section class="user-panel">
+            <header>
+              <div><h2>账号列表</h2><p>统一创建账号、调整状态并重置密码。</p></div>
+              <label class="search-field">
+                <span aria-hidden="true">⌕</span>
+                <input id="userSearch" type="search" placeholder="搜索账号或名称" autocomplete="off" aria-label="搜索用户">
+              </label>
+            </header>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>用户</th><th>角色</th><th>状态</th><th>最近登录</th><th>创建时间</th><th class="action-column">操作</th></tr></thead>
+                <tbody id="userTableBody"><tr><td colspan="6" class="table-empty">正在加载用户…</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <dialog class="admin-dialog" id="createUserDialog">
+      <form method="dialog" id="createUserForm">
+        <header><div><p>NEW ACCOUNT</p><h2>新增用户</h2></div><button class="dialog-close" value="cancel" aria-label="关闭">×</button></header>
+        <div class="dialog-body">
+          <label><span>登录账号</span><input id="newUsername" name="username" minlength="3" maxlength="32" pattern="[A-Za-z0-9_.-]+" autocomplete="off" required><small>3–32 位字母、数字、点、横线或下划线</small></label>
+          <label><span>用户名称</span><input id="newDisplayName" name="displayName" maxlength="40" autocomplete="off" required></label>
+          <label><span>角色</span><select id="newRole" name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label>
+          <label><span>初始密码</span><input id="newPassword" name="password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required><small>至少 10 个字符，创建后可由管理员重置</small></label>
+          <p class="form-error" id="createUserError" role="alert"></p>
+        </div>
+        <footer><button class="secondary-button" value="cancel">取消</button><button class="primary-button" id="createUserButton" type="submit" value="default">创建用户</button></footer>
+      </form>
+    </dialog>
+
+    <dialog class="admin-dialog compact" id="resetPasswordDialog">
+      <form method="dialog" id="resetPasswordForm">
+        <header><div><p>RESET PASSWORD</p><h2>重置密码</h2></div><button class="dialog-close" value="cancel" aria-label="关闭">×</button></header>
+        <div class="dialog-body">
+          <p class="dialog-note">正在为 <strong id="resetUserName">--</strong> 设置新密码。保存后，该用户的其他登录会话会失效。</p>
+          <input id="resetUserId" type="hidden">
+          <label><span>新密码</span><input id="resetPassword" type="password" minlength="10" maxlength="128" autocomplete="new-password" required><small>至少 10 个字符</small></label>
+          <p class="form-error" id="resetPasswordError" role="alert"></p>
+        </div>
+        <footer><button class="secondary-button" value="cancel">取消</button><button class="primary-button" id="resetPasswordButton" type="submit" value="default">保存新密码</button></footer>
+      </form>
+    </dialog>
+
+    <div class="admin-toast" id="adminToast" role="status" aria-live="polite"></div>
+    <script type="module" src="/admin.js?v=20260812-auth"></script>
+  </body>
+</html>

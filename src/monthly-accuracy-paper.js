@@ -67,6 +67,36 @@ export const MONTHLY_ACCURACY_PAPER_PROFILE = Object.freeze({
   }),
 });
 
+export const MONTHLY_ACCURACY_NO_PROFIT_LOCK_PROFILE = Object.freeze({
+  ...MONTHLY_ACCURACY_PAPER_PROFILE,
+  id: 'monthly-accuracy-85-15-no-profit-lock-v2',
+  name: '动态多空组合模拟盘（无月度盈利锁）',
+  marketNeutral: Object.freeze({
+    ...MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutral,
+    monthlyProfitLock: null,
+  }),
+  trend: Object.freeze({
+    ...MONTHLY_ACCURACY_PAPER_PROFILE.trend,
+    monthlyProfitLock: null,
+  }),
+});
+
+export const MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE = Object.freeze({
+  ...MONTHLY_ACCURACY_NO_PROFIT_LOCK_PROFILE,
+  id: 'monthly-accuracy-continuous-derisk-v3',
+  name: '动态多空组合模拟盘（持续交易降风险）',
+  marketNeutral: Object.freeze({
+    ...MONTHLY_ACCURACY_NO_PROFIT_LOCK_PROFILE.marketNeutral,
+    monthlyProfitDeRiskThreshold: 0.0075,
+    monthlyProfitDeRiskScale: 0.10,
+  }),
+  trend: Object.freeze({
+    ...MONTHLY_ACCURACY_NO_PROFIT_LOCK_PROFILE.trend,
+    monthlyProfitDeRiskThreshold: 0.01,
+    monthlyProfitDeRiskScale: 0.10,
+  }),
+});
+
 function round(value, digits = 8) {
   return Number(Number(value).toFixed(digits));
 }
@@ -103,6 +133,83 @@ function utcDate(value) {
 
 export function addUtcDays(value, days) {
   return new Date(utcDate(value) + days * DAY_MS).toISOString().slice(0, 10);
+}
+
+export function migratePaperStateToNoProfitLock(
+  state,
+  {
+    now = Date.now(),
+    targetProfile = MONTHLY_ACCURACY_NO_PROFIT_LOCK_PROFILE,
+  } = {},
+) {
+  if (!state || state.version !== 1) throw new Error('模拟盘状态版本不兼容');
+  if (state.strategyProfileId === targetProfile.id) return state;
+  if (state.strategyProfileId !== MONTHLY_ACCURACY_PAPER_PROFILE.id) {
+    throw new Error(`不支持从 ${state.strategyProfileId || 'unknown'} 迁移到无盈利锁版本`);
+  }
+  const changedAt = new Date(Number(now)).toISOString();
+  const effectiveFromCycleDate = addUtcDays(state.lastCycleDate, 1);
+  const change = {
+    fromProfileId: state.strategyProfileId,
+    toProfileId: targetProfile.id,
+    requestedAt: changedAt,
+    effectiveFromCycleDate,
+    reason: '用户要求取消月度盈利止盈锁，按实际信号继续运行',
+    clearProfitLocks: true,
+    preserveLossLocks: true,
+  };
+  for (const component of Object.values(state.components || {})) {
+    if (component?.lockReason === 'profit') component.lockReason = null;
+  }
+  state.strategyProfileId = targetProfile.id;
+  state.strategyName = targetProfile.name;
+  state.profileSnapshot = profileSnapshot(targetProfile);
+  state.forceRebalanceNextCycle = true;
+  state.pendingStrategyChange = change;
+  state.strategyChanges = [...(state.strategyChanges || []), change];
+  state.updatedAt = changedAt;
+  return state;
+}
+
+export function migratePaperStateToContinuousDeRisk(
+  state,
+  {
+    now = Date.now(),
+    targetProfile = MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE,
+  } = {},
+) {
+  if (!state || state.version !== 1) throw new Error('模拟盘状态版本不兼容');
+  if (state.strategyProfileId === targetProfile.id) return state;
+  const supportedSources = new Set([
+    MONTHLY_ACCURACY_PAPER_PROFILE.id,
+    MONTHLY_ACCURACY_NO_PROFIT_LOCK_PROFILE.id,
+  ]);
+  if (!supportedSources.has(state.strategyProfileId)) {
+    throw new Error(`不支持从 ${state.strategyProfileId || 'unknown'} 迁移到持续交易降风险版本`);
+  }
+  const changedAt = new Date(Number(now)).toISOString();
+  const effectiveFromCycleDate = addUtcDays(state.lastCycleDate, 1);
+  const change = {
+    fromProfileId: state.strategyProfileId,
+    toProfileId: targetProfile.id,
+    requestedAt: changedAt,
+    effectiveFromCycleDate,
+    reason: '复盘单日挤空损失后，取消空仓式止盈并改为保留10%敞口持续交易',
+    clearProfitLocks: true,
+    preserveLossLocks: true,
+    continuousTrading: true,
+  };
+  for (const component of Object.values(state.components || {})) {
+    if (component?.lockReason === 'profit') component.lockReason = null;
+  }
+  state.strategyProfileId = targetProfile.id;
+  state.strategyName = targetProfile.name;
+  state.profileSnapshot = profileSnapshot(targetProfile);
+  state.forceRebalanceNextCycle = true;
+  state.pendingStrategyChange = change;
+  state.strategyChanges = [...(state.strategyChanges || []), change];
+  state.updatedAt = changedAt;
+  return state;
 }
 
 export function latestCompletePaperCycleDate(now = Date.now()) {
@@ -151,14 +258,37 @@ function normalizeDailyMarket(seriesBySymbol, symbols = PAPER_SYMBOLS) {
   };
 }
 
-export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
+export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile, {
+  decisionCycleDate = null,
+} = {}) {
   const settings = profile?.newsOverlay;
   if (!settings?.enabled) return { signalContext: {}, decision: null };
-  const live = newsSnapshot?.status === 'live';
+  const expectedDecisionAt = decisionCycleDate
+    ? Date.parse(`${decisionCycleDate}T01:00:00.000Z`)
+    : null;
+  const capturedAt = Date.parse(
+    newsSnapshot?.capturedForDecisionAt || newsSnapshot?.updatedAt || '',
+  );
+  const cycleMatches = !decisionCycleDate
+    || newsSnapshot?.paperCycleDate === undefined
+    || newsSnapshot?.paperCycleDate === decisionCycleDate;
+  const capturedInWindow = !decisionCycleDate || (
+    Number.isFinite(capturedAt)
+    && capturedAt >= expectedDecisionAt
+    && capturedAt <= expectedDecisionAt + 15 * 60_000
+  );
+  const signalFresh = newsSnapshot?.status === 'live' && cycleMatches && capturedInWindow;
+  const live = signalFresh;
   const newsWeightMode = settings.newsWeightMode || 'fixed';
   const rankingEnabled = newsWeightMode !== 'risk_veto'
     && Number(settings.newsSignalWeight) > 0;
   const riskVetoEnabled = settings.riskVetoEnabled === true;
+  const riskSignalScope = settings.riskSignalScope === 'symbol_specific'
+    ? 'symbol_specific'
+    : 'combined';
+  const riskEvidenceMode = settings.riskEvidenceMode === 'confirmed_or_independent_event'
+    ? 'confirmed_or_independent_event'
+    : 'legacy_article_count';
   const riskMinimumCredibility = Number(settings.riskMinimumCredibility || 65);
   const riskMinimumConfidence = Number(settings.riskMinimumConfidence || 50);
   const riskMinimumArticleCount = Number(settings.riskMinimumArticleCount || 3);
@@ -176,6 +306,27 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
     const summary = newsSnapshot?.summary?.bySymbol?.[symbol] || null;
     const gate = evaluateNewsGate(settings, summary);
     const score = Number(summary?.score || 0);
+    const riskScore = riskSignalScope === 'symbol_specific'
+      ? Number(summary?.symbolSpecificScore || 0)
+      : score;
+    const riskDirection = riskSignalScope === 'symbol_specific'
+      ? summary?.symbolSpecificDirection || 'neutral'
+      : summary?.direction || 'neutral';
+    const riskCredibility = riskSignalScope === 'symbol_specific'
+      ? Number(summary?.symbolSpecificCredibility || 0)
+      : Number(summary?.credibility || 0);
+    const riskConfidence = riskSignalScope === 'symbol_specific'
+      ? Number(summary?.symbolSpecificConfidence || 0)
+      : Number(summary?.confidence || 0);
+    const riskArticleCount = riskSignalScope === 'symbol_specific'
+      ? Number(summary?.symbolSpecificArticleCount || 0)
+      : Number(summary?.articleCount || 0);
+    const riskDirectionalEvidence = riskSignalScope === 'symbol_specific'
+      ? summary?.symbolSpecificDirectionalEvidence?.[riskDirection] || null
+      : summary?.directionalEvidence?.[riskDirection] || null;
+    const riskEvidencePassed = riskEvidenceMode !== 'confirmed_or_independent_event'
+      || Number(riskDirectionalEvidence?.confirmedEventCount || 0) >= 1
+      || Number(riskDirectionalEvidence?.corroboratedEventCount || 0) >= 1;
     const eligible = rankingEnabled
       && live
       && gate.eligible
@@ -183,12 +334,13 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
       && Math.abs(score) >= settings.minimumAbsoluteScore;
     const riskEligible = riskVetoEnabled
       && live
-      && Number.isFinite(score)
-      && Math.abs(score) >= riskMinimumAbsoluteScore
-      && ['bullish', 'bearish'].includes(summary?.direction)
-      && Number(summary?.credibility || 0) >= riskMinimumCredibility
-      && Number(summary?.confidence || 0) >= riskMinimumConfidence
-      && Number(summary?.articleCount || 0) >= riskMinimumArticleCount;
+      && Number.isFinite(riskScore)
+      && Math.abs(riskScore) >= riskMinimumAbsoluteScore
+      && ['bullish', 'bearish'].includes(riskDirection)
+      && riskCredibility >= riskMinimumCredibility
+      && riskConfidence >= riskMinimumConfidence
+      && riskArticleCount >= riskMinimumArticleCount
+      && riskEvidencePassed;
     const qualityMultiplier = eligible && newsWeightMode === 'quality'
       ? Math.min(1, Math.max(0, Number(summary?.credibility || 0) / 100))
         * Math.min(1, Math.max(0, Number(summary?.confidence || 0) / 100))
@@ -198,13 +350,22 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
     return {
       symbol,
       score: round(score, 4),
+      riskScore: round(riskScore, 4),
       eligible,
       riskEligible,
       gate,
       direction: summary?.direction || 'neutral',
+      riskDirection,
       articleCount: summary?.articleCount || 0,
+      riskArticleCount,
       credibility: Number(summary?.credibility || 0),
+      riskCredibility,
       confidence: Number(summary?.confidence || 0),
+      riskConfidence,
+      riskSignalScope,
+      riskEvidenceMode,
+      riskDirectionalEvidence,
+      riskEvidencePassed,
       qualityMultiplier: round(qualityMultiplier, 4),
       appliedNewsWeightPercent,
     };
@@ -218,7 +379,7 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
   ]));
   const newsRiskScoresBySymbol = Object.fromEntries(riskEligible.map((item) => [
     item.symbol,
-    item.score,
+    item.riskScore,
   ]));
   const sourceStatus = newsSnapshot?.sourceStatus || [];
   const fingerprint = eligible.length || riskEligible.length
@@ -228,7 +389,9 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
         item.score,
         item.appliedNewsWeightPercent,
       ]),
-      risk: riskEligible.map((item) => [item.symbol, item.score]),
+      riskSignalScope,
+      riskEvidenceMode,
+      risk: riskEligible.map((item) => [item.symbol, item.riskScore]),
     })
     : `price-only:${newsSnapshot?.status || 'missing'}`;
   const appliedWeights = eligible.map((item) => item.appliedNewsWeightPercent);
@@ -247,12 +410,21 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
       newsWeightMode,
       status: newsSnapshot?.status || 'missing',
       capturedAt: newsSnapshot?.updatedAt || null,
+      expectedDecisionAt: Number.isFinite(expectedDecisionAt)
+        ? new Date(expectedDecisionAt).toISOString()
+        : null,
+      snapshotAgeMinutes: Number.isFinite(expectedDecisionAt) && Number.isFinite(capturedAt)
+        ? round((capturedAt - expectedDecisionAt) / 60_000, 2)
+        : null,
+      signalFresh,
       requestedNewsWeightPercent: settings.newsSignalWeight,
       appliedNewsWeightPercent: appliedWeights.length ? round(Math.max(...appliedWeights), 2) : 0,
       averageAppliedNewsWeightPercent: appliedWeights.length
         ? round(mean(appliedWeights), 2)
         : 0,
       riskVetoEnabled,
+      riskSignalScope,
+      riskEvidenceMode,
       requestedRiskGrossExposureScale: riskGrossExposureScale,
       riskEligibleSymbols: riskEligible,
       riskVetoTriggered: false,
@@ -260,10 +432,16 @@ export function buildPaperNewsSignalContext(newsSnapshot, symbols, profile) {
       appliedRiskGrossExposureScale: 1,
       fallbackToPriceOnly: eligible.length === 0,
       fallbackReason: !live
-        ? '新闻快照不可用或不是实时状态'
+        ? newsSnapshot?.status === 'live' && !signalFresh
+          ? '新闻快照周期或捕获时点不符合决策窗口'
+          : '新闻快照不可用或不是实时状态'
         : eligible.length
           ? null
-          : '没有同时通过可信度、方向置信度、官方确认和方向强度门槛的消息',
+          : riskVetoEnabled && riskEligible.length
+            ? '新闻风控信号未与已选持仓方向冲突'
+            : riskVetoEnabled
+              ? '没有通过新闻风控门槛的消息'
+              : '没有同时通过可信度、方向置信度、官方确认和方向强度门槛的消息',
       eligibleSymbols: eligible,
       evaluatedSymbols: evaluated,
       sourceAvailability: {
@@ -281,18 +459,58 @@ function marketReturn(weights, previousPrices, currentPrices, symbols = PAPER_SY
   ), 0);
 }
 
-function updateMonthlyLock(component, settings) {
-  const monthlyReturn = component.equity / component.monthStartEquity - 1;
+export function updateMonthlyLock(component, settings, {
+  settlementStartEquity = component.equity,
+  currentWeights = {},
+  closeWillExecute = true,
+} = {}) {
+  const grossMonthlyReturn = component.equity / component.monthStartEquity - 1;
+  const monthlyProfitLockNetOfExitCost = settings.monthlyProfitLockNetOfExitCost === true;
+  const estimatedExitTurnover = closeWillExecute ? sumAbsolute(currentWeights) : 0;
+  const estimatedExitTradingCostReturn = estimatedExitTurnover
+    * Number(settings.tradingCostRate || 0);
+  const projectedPostExitEquity = component.equity
+    - settlementStartEquity * estimatedExitTradingCostReturn;
+  const projectedNetMonthlyReturn = projectedPostExitEquity / component.monthStartEquity - 1;
+  const profitComparisonMonthlyReturn = monthlyProfitLockNetOfExitCost
+    ? projectedNetMonthlyReturn
+    : grossMonthlyReturn;
+  const profitLockActionable = !monthlyProfitLockNetOfExitCost || closeWillExecute;
+  const previousLockReason = component.lockReason;
   if (component.lockReason === null
     && settings.monthlyProfitLock !== null
-    && monthlyReturn >= settings.monthlyProfitLock) {
+    && profitLockActionable
+    && profitComparisonMonthlyReturn >= settings.monthlyProfitLock) {
     component.lockReason = 'profit';
   } else if (component.lockReason === null
     && settings.monthlyLossLimit !== null
-    && monthlyReturn <= -settings.monthlyLossLimit) {
+    && grossMonthlyReturn <= -settings.monthlyLossLimit) {
     component.lockReason = 'loss';
   }
-  return monthlyReturn;
+  return {
+    mode: monthlyProfitLockNetOfExitCost ? 'net_of_exit_cost' : 'gross',
+    monthlyProfitLockNetOfExitCost,
+    grossMonthlyReturn,
+    projectedNetMonthlyReturn,
+    profitComparisonMonthlyReturn,
+    estimatedExitTurnover,
+    estimatedExitTradingCostReturn,
+    closeWillExecute,
+    profitLockActionable,
+    triggeredLockReason: previousLockReason === null ? component.lockReason : null,
+    lockReason: component.lockReason,
+  };
+}
+
+function lockEvaluationSnapshot(evaluation) {
+  return {
+    ...evaluation,
+    grossMonthlyReturn: round(evaluation.grossMonthlyReturn),
+    projectedNetMonthlyReturn: round(evaluation.projectedNetMonthlyReturn),
+    profitComparisonMonthlyReturn: round(evaluation.profitComparisonMonthlyReturn),
+    estimatedExitTurnover: round(evaluation.estimatedExitTurnover),
+    estimatedExitTradingCostReturn: round(evaluation.estimatedExitTradingCostReturn),
+  };
 }
 
 function resetMonthIfNeeded(component, upcomingResultDate) {
@@ -302,6 +520,26 @@ function resetMonthIfNeeded(component, upcomingResultDate) {
   component.monthStartEquity = component.equity;
   component.lockReason = null;
   return true;
+}
+
+function monthlyProfitDeRisk(component, settings) {
+  const threshold = settings.monthlyProfitDeRiskThreshold;
+  const configuredScale = settings.monthlyProfitDeRiskScale;
+  const enabled = Number.isFinite(threshold)
+    && threshold > 0
+    && Number.isFinite(configuredScale)
+    && configuredScale > 0
+    && configuredScale < 1;
+  const monthlyReturn = component.equity / component.monthStartEquity - 1;
+  const active = enabled && monthlyReturn >= threshold;
+  return {
+    enabled,
+    active,
+    threshold: enabled ? threshold : null,
+    scale: active ? configuredScale : 1,
+    configuredScale: enabled ? configuredScale : 1,
+    monthlyReturn,
+  };
 }
 
 function prepareMarketNeutral({
@@ -326,7 +564,9 @@ function prepareMarketNeutral({
   }
   const monthChanged = resetMonthIfNeeded(component, upcomingResultDate);
   const scheduled = isCalendarRebalanceDay(signalDate, settings.rebalanceDays);
-  const news = buildPaperNewsSignalContext(newsSnapshot, market.symbols, profile);
+  const news = buildPaperNewsSignalContext(newsSnapshot, market.symbols, profile, {
+    decisionCycleDate: addUtcDays(upcomingResultDate, -1),
+  });
   const newsDecisionChanged = Boolean(
     news.decision
     && component.lastNewsDecision?.fingerprint !== news.decision.fingerprint
@@ -349,15 +589,27 @@ function prepareMarketNeutral({
     proposedBaseWeights = allocation.weights;
     proposedLeverage = allocation.leverage;
   }
-  const proposedWeights = component.lockReason === null
+  let proposedWeights = component.lockReason === null
     ? { ...proposedBaseWeights }
     : zeroWeights(market.symbols);
+  const profitDeRisk = monthlyProfitDeRisk(component, settings);
+  if (component.lockReason === null && profitDeRisk.active) {
+    proposedWeights = Object.fromEntries(Object.entries(proposedWeights).map(([symbol, weight]) => [
+      symbol,
+      weight * profitDeRisk.scale,
+    ]));
+  }
+  const previousProfitDeRiskActive = component.lastProfitDeRisk?.active === true;
+  const profitDeRiskChanged = previousProfitDeRiskActive !== profitDeRisk.active;
+  const needsLockClose = component.lockReason !== null
+    && sumAbsolute(component.weights) > 0;
   const proposedTurnover = turnover(component.weights, proposedWeights, market.symbols);
   const suppressed = shouldSuppressSmallRebalance({
     scheduled,
     force,
     monthChanged,
-    referenceScaleChanged: newsDecisionChanged,
+    needsLockClose,
+    referenceScaleChanged: newsDecisionChanged || profitDeRiskChanged,
     proposedTurnover,
     minimumRebalanceTurnover: settings.minimumRebalanceTurnover || 0,
   });
@@ -365,6 +617,7 @@ function prepareMarketNeutral({
   const changed = force
     || monthChanged
     || newsDecisionChanged
+    || profitDeRiskChanged
     || (scheduled && !suppressed)
     || turnover(component.weights, nextWeights, market.symbols) > 0;
   const nextTurnover = changed ? turnover(component.weights, nextWeights, market.symbols) : 0;
@@ -391,6 +644,7 @@ function prepareMarketNeutral({
     }
   }
   component.weights = nextWeights;
+  component.lastProfitDeRisk = profitDeRisk;
   if (news.decision) {
     const previousNewsDecision = component.lastNewsDecision || null;
     const riskVetoTriggered = component.lockReason === null && (allocation
@@ -435,6 +689,7 @@ function prepareMarketNeutral({
     dynamicLeverage: component.dynamicLeverage,
     newsDecision: component.lastNewsDecision || null,
     adaptiveRisk: component.lastAdaptiveRisk || null,
+    profitDeRisk,
   };
 }
 
@@ -447,7 +702,11 @@ function prepareTrend({
 }) {
   const settings = profile.trend;
   const signalIndex = market.dateIndex.get(signalDate);
-  const warmup = Math.max(...settings.lookbackDays, settings.volatilityWindowDays);
+  const warmup = Math.max(
+    ...settings.lookbackDays,
+    settings.volatilityWindowDays,
+    settings.shortConfirmationLookbackDays || 0,
+  );
   if (!Number.isInteger(signalIndex) || signalIndex < warmup) {
     throw new Error(`${signalDate} 趋势信号预热不足`);
   }
@@ -464,17 +723,31 @@ function prepareTrend({
       dynamicLeverage: 1,
       activeSignalCount: 0,
       averageSignalStrength: 0,
+      shortConfirmation: {
+        enabled: Number.isInteger(settings.shortConfirmationLookbackDays),
+        lookbackDays: settings.shortConfirmationLookbackDays || null,
+        minimumReturn: settings.shortConfirmationMinimumReturn || 0,
+        rejectedSymbols: [],
+      },
     };
+  const profitDeRisk = monthlyProfitDeRisk(component, settings);
+  if (component.lockReason === null && profitDeRisk.active) {
+    for (const symbol of market.symbols) allocation.weights[symbol] *= profitDeRisk.scale;
+  }
   const nextTurnover = turnover(component.weights, allocation.weights, market.symbols);
   component.weights = allocation.weights;
   component.dynamicLeverage = allocation.dynamicLeverage;
   component.activeSignalCount = allocation.activeSignalCount;
   component.averageSignalStrength = allocation.averageSignalStrength;
+  component.shortConfirmation = allocation.shortConfirmation || null;
+  component.lastProfitDeRisk = profitDeRisk;
   return {
     turnover: nextTurnover,
     monthChanged,
     dynamicLeverage: component.dynamicLeverage,
     activeSignalCount: component.activeSignalCount,
+    shortConfirmation: component.shortConfirmation,
+    profitDeRisk,
   };
 }
 
@@ -540,6 +813,7 @@ function reportSummary(state, report) {
         dynamicLeverage: state.components.marketNeutral.dynamicLeverage,
         newsOverlay: state.components.marketNeutral.lastNewsDecision || null,
         adaptiveRisk: state.components.marketNeutral.lastAdaptiveRisk || null,
+        profitDeRisk: state.components.marketNeutral.lastProfitDeRisk || null,
       },
       trend: {
         currentMonth: state.components.trend.currentMonth,
@@ -548,6 +822,8 @@ function reportSummary(state, report) {
         ),
         lockReason: state.components.trend.lockReason,
         dynamicLeverage: state.components.trend.dynamicLeverage,
+        shortConfirmation: state.components.trend.shortConfirmation || null,
+        profitDeRisk: state.components.trend.lastProfitDeRisk || null,
       },
     },
   };
@@ -601,6 +877,7 @@ export function initializePaperState({
         dynamicLeverage: 1,
         lastNewsDecision: null,
         lastAdaptiveRisk: null,
+        lastProfitDeRisk: null,
       },
       trend: {
         equity: 1,
@@ -611,6 +888,8 @@ export function initializePaperState({
         dynamicLeverage: 1,
         activeSignalCount: 0,
         averageSignalStrength: 0,
+        shortConfirmation: null,
+        lastProfitDeRisk: null,
       },
     },
     reports: [],
@@ -692,8 +971,13 @@ export function initializePaperState({
     symbolAttribution: [],
     settledNewsOverlay: null,
     settledAdaptiveRisk: null,
+    settledProfitDeRisk: null,
     nextNewsOverlay: marketNeutralTrade.newsDecision,
     nextAdaptiveRisk: marketNeutralTrade.adaptiveRisk,
+    nextProfitDeRisk: {
+      marketNeutral: marketNeutralTrade.profitDeRisk,
+      trend: trendTrade.profitDeRisk,
+    },
     notes: [
       '今天只建立模拟仓位基线，不回填开始日前收益。',
       `${state.partialStartMonth} 为月中启动的不完整月份，不计入盈利月统计。`,
@@ -715,6 +999,7 @@ function prepareAfterSettlement({
   cycleDate,
   profile,
   newsSnapshot = null,
+  forceMarketNeutralRebalance = false,
 }) {
   const signalDate = addUtcDays(cycleDate, -1);
   const upcomingResultDate = addUtcDays(cycleDate, 1);
@@ -724,6 +1009,7 @@ function prepareAfterSettlement({
     signalDate,
     upcomingResultDate,
     profile,
+    force: forceMarketNeutralRebalance,
     newsSnapshot,
   });
   const trendTrade = prepareTrend({
@@ -752,6 +1038,10 @@ export function advancePaperState({
   const market = normalizeDailyMarket(seriesBySymbol);
   let cycleDate = addUtcDays(state.lastCycleDate, 1);
   while (cycleDate <= throughCycleDate) {
+    const pendingStrategyChange = state.pendingStrategyChange || null;
+    const activatingStrategyChange = state.forceRebalanceNextCycle === true
+      && (!pendingStrategyChange?.effectiveFromCycleDate
+        || pendingStrategyChange.effectiveFromCycleDate <= cycleDate);
     const currentPrices = markPricesByCycleDate[cycleDate];
     validatePrices(currentPrices);
     validatePrices(state.latestPrices);
@@ -801,13 +1091,25 @@ export function advancePaperState({
     state.components.marketNeutral.equity = marketNeutralStart
       * (1 + marketNeutralMarketReturn + marketNeutralCarryReturn);
     state.components.trend.equity = trendStart * (1 + trendMarketReturn + trendCarryReturn);
-    const settledMarketNeutralMonthReturn = updateMonthlyLock(
+    const upcomingResultDate = addUtcDays(cycleDate, 1);
+    const closeWillExecute = upcomingResultDate.slice(0, 7) === cycleDate.slice(0, 7);
+    const settledMarketNeutralLockEvaluation = updateMonthlyLock(
       state.components.marketNeutral,
       profile.marketNeutral,
+      {
+        settlementStartEquity: marketNeutralStart,
+        currentWeights: state.components.marketNeutral.weights,
+        closeWillExecute,
+      },
     );
-    const settledTrendMonthReturn = updateMonthlyLock(
+    const settledTrendLockEvaluation = updateMonthlyLock(
       state.components.trend,
       profile.trend,
+      {
+        settlementStartEquity: trendStart,
+        currentWeights: state.components.trend.weights,
+        closeWillExecute,
+      },
     );
     const settledLocks = {
       marketNeutral: state.components.marketNeutral.lockReason,
@@ -815,12 +1117,17 @@ export function advancePaperState({
     };
     const settledNewsOverlay = state.components.marketNeutral.lastNewsDecision || null;
     const settledAdaptiveRisk = state.components.marketNeutral.lastAdaptiveRisk || null;
+    const settledProfitDeRisk = {
+      marketNeutral: state.components.marketNeutral.lastProfitDeRisk || null,
+      trend: state.components.trend.lastProfitDeRisk || null,
+    };
 
     const { signalDate, marketNeutralTrade, trendTrade } = prepareAfterSettlement({
       state,
       market,
       cycleDate,
       profile,
+      forceMarketNeutralRebalance: activatingStrategyChange,
       newsSnapshot: newsSnapshotsByCycleDate[cycleDate] || null,
     });
     const marketNeutralTradingReturn = -marketNeutralTrade.turnover
@@ -899,23 +1206,45 @@ export function advancePaperState({
       symbolAttribution,
       settledMonth: cycleDate.slice(0, 7),
       settledMonthReturns: {
-        marketNeutral: round(settledMarketNeutralMonthReturn),
-        trend: round(settledTrendMonthReturn),
+        marketNeutral: round(settledMarketNeutralLockEvaluation.grossMonthlyReturn),
+        trend: round(settledTrendLockEvaluation.grossMonthlyReturn),
+      },
+      settledLockEvaluation: {
+        marketNeutral: lockEvaluationSnapshot(settledMarketNeutralLockEvaluation),
+        trend: lockEvaluationSnapshot(settledTrendLockEvaluation),
       },
       settledLocks,
       settledNewsOverlay,
       settledAdaptiveRisk,
+      settledProfitDeRisk,
       nextNewsOverlay: marketNeutralTrade.newsDecision,
       nextAdaptiveRisk: marketNeutralTrade.adaptiveRisk,
+      nextProfitDeRisk: {
+        marketNeutral: marketNeutralTrade.profitDeRisk,
+        trend: trendTrade.profitDeRisk,
+      },
       turnover: {
         marketNeutral: round(marketNeutralTrade.turnover),
         trend: round(trendTrade.turnover),
       },
-      notes: [],
+      strategyChangeApplied: activatingStrategyChange
+        ? {
+          ...(pendingStrategyChange || {}),
+          appliedAt: new Date(now).toISOString(),
+          appliedCycleDate: cycleDate,
+        }
+        : null,
+      notes: activatingStrategyChange
+        ? [`本周期启用${profile.name}，并按最新完整信号重新计算横截面与趋势仓位。`]
+        : [],
     });
     state.latestReport = report;
     state.reports.push(report);
     state.reports = state.reports.slice(-MAX_REPORTS);
+    if (activatingStrategyChange) {
+      state.forceRebalanceNextCycle = false;
+      state.pendingStrategyChange = null;
+    }
     cycleDate = addUtcDays(cycleDate, 1);
   }
   return state;
@@ -1107,7 +1436,7 @@ export function paperPortfolioSnapshot(state) {
       mode: 'PAPER',
       status: 'not_started',
       strategyType: 'monthlyAccuracyPortfolio',
-      strategyName: MONTHLY_ACCURACY_PAPER_PROFILE.name,
+      strategyName: MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE.name,
       timezone: 'Asia/Shanghai',
       schedule: '09:00',
       nextReportAt: null,
@@ -1141,7 +1470,36 @@ export function paperPortfolioSnapshot(state) {
     positions: state.positions || [],
     latestReport: state.latestReport || null,
     reports: state.reports || [],
-    componentState: state.latestReport?.componentState || null,
+    componentState: state.components ? {
+      marketNeutral: {
+        currentMonth: state.components.marketNeutral.currentMonth,
+        monthlyReturn: round(
+          state.components.marketNeutral.equity
+            / state.components.marketNeutral.monthStartEquity - 1,
+        ),
+        lockReason: state.components.marketNeutral.lockReason,
+        dynamicLeverage: state.components.marketNeutral.dynamicLeverage,
+        newsOverlay: state.components.marketNeutral.lastNewsDecision || null,
+        adaptiveRisk: state.components.marketNeutral.lastAdaptiveRisk || null,
+        profitDeRisk: state.components.marketNeutral.lastProfitDeRisk || null,
+      },
+      trend: {
+        currentMonth: state.components.trend.currentMonth,
+        monthlyReturn: round(
+          state.components.trend.equity / state.components.trend.monthStartEquity - 1,
+        ),
+        lockReason: state.components.trend.lockReason,
+        dynamicLeverage: state.components.trend.dynamicLeverage,
+        shortConfirmation: state.components.trend.shortConfirmation || null,
+        profitDeRisk: state.components.trend.lastProfitDeRisk || null,
+      },
+    } : null,
+    monthlyProfitLockEnabled: {
+      marketNeutral: state.profileSnapshot?.marketNeutral?.monthlyProfitLock !== null,
+      trend: state.profileSnapshot?.trend?.monthlyProfitLock !== null,
+    },
+    pendingStrategyChange: state.pendingStrategyChange || null,
+    latestStrategyChange: state.strategyChanges?.at(-1) || null,
     updatedAt: state.updatedAt,
   };
 }

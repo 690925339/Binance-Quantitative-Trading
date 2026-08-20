@@ -131,6 +131,97 @@ test('趋势月度锁定后复盘会提示横截面独自承担主要风险', ()
   assert.match(review.latestAttribution.diagnostics.join(' '), /趋势子策略已触发月度止盈锁定/);
 });
 
+test('双子策略止盈后复盘会记录连续空仓和本月锁定收益', () => {
+  const baseline = stateFor(MONTHLY_ACCURACY_PAPER_PROFILE, {
+    observations: 3,
+    dailyReturn: 0.001,
+    attribution: true,
+  });
+  const reports = baseline.reports.filter((report) => report.kind === 'daily');
+  for (const report of reports.slice(-2)) {
+    report.settledLocks = { marketNeutral: 'profit', trend: 'profit' };
+    report.modelGrossExposure = 0;
+    report.positions = [];
+  }
+  baseline.components = {
+    marketNeutral: {
+      baseWeights: { ETHUSDT: 0.5, SOLUSDT: -0.5 },
+    },
+  };
+  baseline.profileSnapshot = MONTHLY_ACCURACY_PAPER_PROFILE;
+  const review = buildPaperStrategyReview({ baselineState: baseline, shadowStates: [] });
+  assert.deepEqual(review.monthlyLockReview, {
+    month: '2024-01',
+    marketNeutralLockReason: 'profit',
+    trendLockReason: 'profit',
+    bothProfitLocked: true,
+    bothProfitLockedSince: '2024-01-03',
+    consecutiveIdleDays: 2,
+    monthToDatePnl: 30,
+    monthToDateReturn: 0.003003,
+    currentGrossExposure: 0,
+    profitLocksEnabled: true,
+    profitDeRisk: {
+      marketNeutral: null,
+      trend: null,
+    },
+    pendingStrategyChange: null,
+    lockedMarketNeutralHoldCounterfactual: {
+      method: 'frozen_market_neutral_weights_after_dual_lock',
+      observations: 1,
+      grossExposure: 1,
+      componentReturn: -0.00505,
+      portfolioReturn: -0.0042925,
+      portfolioPnl: -42.925,
+    },
+  });
+  assert.match(review.latestAttribution.diagnostics.join(' '), /连续空仓 2 个结算日/);
+  assert.match(review.latestAttribution.diagnostics.join(' '), /事后代理收益/);
+});
+
+test('持续交易降风险启用后复盘会说明保留敞口而非盈利空仓', () => {
+  const baseline = stateFor(MONTHLY_ACCURACY_PAPER_PROFILE, {
+    observations: 2,
+    dailyReturn: 0.001,
+    attribution: true,
+  });
+  baseline.profileSnapshot = {
+    ...MONTHLY_ACCURACY_PAPER_PROFILE,
+    marketNeutral: { ...MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutral, monthlyProfitLock: null },
+    trend: { ...MONTHLY_ACCURACY_PAPER_PROFILE.trend, monthlyProfitLock: null },
+  };
+  baseline.components = {
+    marketNeutral: {
+      lockReason: null,
+      lastProfitDeRisk: { active: true, scale: 0.1, threshold: 0.0075 },
+    },
+    trend: {
+      lockReason: null,
+      lastProfitDeRisk: { active: true, scale: 0.1, threshold: 0.01 },
+    },
+  };
+  const review = buildPaperStrategyReview({ baselineState: baseline, shadowStates: [] });
+  assert.equal(review.monthlyLockReview.profitLocksEnabled, false);
+  assert.equal(review.monthlyLockReview.profitDeRisk.marketNeutral.active, true);
+  assert.match(review.latestAttribution.diagnostics.join(' '), /保留10%敞口/);
+});
+
+test('趋势空头遇到多标的同步上涨时复盘会标明反向行情', () => {
+  const baseline = stateFor(MONTHLY_ACCURACY_PAPER_PROFILE, {
+    observations: 2,
+    dailyReturn: -0.01,
+    attribution: true,
+  });
+  baseline.latestReport.componentAttribution.trend.totalPnl = -120;
+  for (const item of baseline.latestReport.symbolAttribution) {
+    item.assetReturn = 0.08;
+    item.trendPricePnl = -60;
+    item.totalPricePnl = -60;
+  }
+  const review = buildPaperStrategyReview({ baselineState: baseline, shadowStates: [] });
+  assert.match(review.latestAttribution.diagnostics.join(' '), /同步上涨标的/);
+});
+
 test('高换手日复盘会拆分价格收益、成本拖累和子策略换手', () => {
   const baseline = stateFor(MONTHLY_ACCURACY_PAPER_PROFILE, {
     observations: 2,
@@ -185,6 +276,11 @@ test('新闻影子会统计真实触发天数而不是把价格回退当作新�
   const result = review.candidates.find((item) => item.id === profile.id);
   assert.deepEqual(result.newsEvidence, {
     evaluatedDays: 3,
+    liveDays: 0,
+    staleDays: 0,
+    unavailableDays: 0,
+    missingDays: 3,
+    liveCoverageRatio: 0,
     activeDays: 1,
     fallbackDays: 2,
     activationRatio: 0.33333333,

@@ -1,7 +1,11 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { addUtcDays, MONTHLY_ACCURACY_PAPER_PROFILE } from './monthly-accuracy-paper.js';
+import {
+  addUtcDays,
+  MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE,
+  MONTHLY_ACCURACY_PAPER_PROFILE,
+} from './monthly-accuracy-paper.js';
 
 const DAY_MS = 86_400_000;
 const BASELINE_ENTRY_REPORT_KIND = 'initialization';
@@ -93,6 +97,30 @@ export const PAPER_SHADOW_PROFILES = Object.freeze([
       minimumConfirmedArticles: 1,
       minimumAbsoluteScore: 0.12,
       riskVetoEnabled: true,
+      riskMinimumCredibility: 65,
+      riskMinimumConfidence: 50,
+      riskMinimumArticleCount: 3,
+      riskMinimumAbsoluteScore: 0.15,
+      riskGrossExposureScale: 0.75,
+    },
+    cashWeight: 0,
+  }),
+  frozenProfile({
+    id: 'shadow-news-specific-risk-v1',
+    name: '新闻专属风控影子｜仅标的新闻冲突时敞口75%',
+    role: 'news_specific_risk_veto',
+    hypothesis: '排除泛市场新闻，仅在标的专属新闻与价格持仓方向冲突时缩减横截面敞口，减少伪相关误触发。',
+    newsOverlay: {
+      enabled: true,
+      newsWeightMode: 'risk_veto',
+      priceSignalWeight: 100,
+      newsSignalWeight: 0,
+      minimumNewsCredibility: 75,
+      minimumNewsConfidence: 65,
+      minimumConfirmedArticles: 1,
+      minimumAbsoluteScore: 0.12,
+      riskVetoEnabled: true,
+      riskSignalScope: 'symbol_specific',
       riskMinimumCredibility: 65,
       riskMinimumConfidence: 50,
       riskMinimumArticleCount: 3,
@@ -374,6 +402,11 @@ function newsEvidence(state, acceptedDates) {
   if (!decisions.length) {
     return {
       evaluatedDays: 0,
+      liveDays: 0,
+      staleDays: 0,
+      unavailableDays: 0,
+      missingDays: 0,
+      liveCoverageRatio: null,
       activeDays: 0,
       fallbackDays: 0,
       activationRatio: null,
@@ -389,6 +422,10 @@ function newsEvidence(state, acceptedDates) {
   ));
   const riskVeto = decisions.filter((decision) => decision.riskVetoTriggered);
   const fallback = decisions.filter((decision) => decision.fallbackToPriceOnly);
+  const statusCount = (status) => decisions.filter((decision) => (
+    (decision.status || 'missing') === status
+  )).length;
+  const liveDays = statusCount('live');
   const reasons = new Map();
   for (const decision of fallback) {
     const reason = decision.fallbackReason || '未记录回退原因';
@@ -398,6 +435,11 @@ function newsEvidence(state, acceptedDates) {
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0] || null;
   return {
     evaluatedDays: decisions.length,
+    liveDays,
+    staleDays: statusCount('stale'),
+    unavailableDays: statusCount('unavailable'),
+    missingDays: statusCount('missing'),
+    liveCoverageRatio: round(liveDays / decisions.length),
     activeDays: active.length,
     fallbackDays: fallback.length,
     activationRatio: round(active.length / decisions.length),
@@ -499,6 +541,7 @@ function matchedCandidate(baselineState, candidateState, profile, trialCount) {
 function latestAttribution(state) {
   const report = state?.latestReport;
   if (!report || report.kind !== 'daily' || !report.symbolAttribution?.length) return null;
+  const lockReview = monthlyLockReview(state);
   const symbols = [...report.symbolAttribution].sort((left, right) => (
     left.totalPricePnl - right.totalPricePnl
   ));
@@ -540,6 +583,12 @@ function latestAttribution(state) {
     .slice(0, 2)
     .reduce((sum, value) => sum + value, 0);
   const diagnostics = [];
+  const risingTrendShorts = report.symbolAttribution.filter((item) => (
+    Number(item.trendWeight || 0) < 0 && Number(item.assetReturn || 0) > 0
+  ));
+  if (Number(trend?.totalPnl || 0) < 0 && risingTrendShorts.length >= 2) {
+    diagnostics.push(`趋势袖套的滞后空头在 ${risingTrendShorts.length} 个同步上涨标的上遭遇反向行情，是本日趋势亏损的直接来源。`);
+  }
   if (Number(marketNeutral?.totalPnl || 0) < 0 && Number(trend?.totalPnl || 0) > 0) {
     diagnostics.push('横截面相对价值腿失效，趋势空头提供了部分对冲。');
   }
@@ -549,11 +598,31 @@ function latestAttribution(state) {
   if (marketNeutralGross > 0 && largestTwoMarketNeutral / marketNeutralGross >= 0.75) {
     diagnostics.push('横截面风险集中在少数多空腿，普通价差反转会被动态杠杆放大。');
   }
-  const trendLockReason = report.settledLocks?.trend || null;
-  if (marketNeutralGross > 0 && trendLockReason === 'profit') {
+  const trendLockReason = lockReview?.trendLockReason ?? report.settledLocks?.trend ?? null;
+  if (lockReview?.pendingStrategyChange?.continuousTrading) {
+    diagnostics.push(`持续交易降风险修复已登记，将于 ${lockReview.pendingStrategyChange.effectiveFromCycleDate} 的09:00周期按最新完整信号重新计算仓位；达到月内收益阈值后保留10%敞口，不会因盈利而空仓。`);
+  } else if (lockReview?.pendingStrategyChange) {
+    diagnostics.push(`月度盈利止盈已取消，将于 ${lockReview.pendingStrategyChange.effectiveFromCycleDate} 的09:00周期按最新完整信号重新计算仓位。`);
+  } else if (lockReview?.bothProfitLocked && lockReview.currentGrossExposure === 0) {
+    diagnostics.push(`横截面与趋势均已月度止盈，连续空仓 ${lockReview.consecutiveIdleDays} 个结算日；本月已锁定 ${(lockReview.monthToDateReturn * 100).toFixed(2)}%，下月自动重置。`);
+    const holdProxy = lockReview.lockedMarketNeutralHoldCounterfactual;
+    if (holdProxy?.observations) {
+      diagnostics.push(`锁仓后继续冻结持有原横截面仓位的事后代理收益为 ${(holdProxy.portfolioReturn * 100).toFixed(2)}%（${holdProxy.portfolioPnl.toFixed(2)} USDT）；该值只复盘机会成本，不是可交易回测。`);
+    }
+  } else if (marketNeutralGross > 0 && trendLockReason === 'profit') {
     diagnostics.push('趋势子策略已触发月度止盈锁定，本月剩余时间由横截面仓位独自承担主要风险。');
   } else if (marketNeutralGross > 0 && trendLockReason === 'loss') {
     diagnostics.push('趋势子策略已触发月度止损锁定，本月剩余时间不再提供趋势对冲。');
+  } else if (lockReview?.profitLocksEnabled === false
+    && lockReview.currentGrossExposure === 0) {
+    diagnostics.push('月度盈利止盈已关闭；当前空仓只可能来自最新信号未形成可执行仓位或保留的亏损风控。');
+  }
+  const activeDeRiskSleeves = [
+    ['横截面', lockReview?.profitDeRisk?.marketNeutral],
+    ['趋势', lockReview?.profitDeRisk?.trend],
+  ].filter(([, value]) => value?.active === true);
+  if (activeDeRiskSleeves.length) {
+    diagnostics.push(`${activeDeRiskSleeves.map(([name]) => name).join('与')}已达到月内收益保护阈值，继续按最新信号交易并保留10%敞口。`);
   }
   if (Math.abs(Number(report.dayPnl || 0)) > 0 && totalCost / Math.abs(report.dayPnl) >= 0.25) {
     diagnostics.push('成本占当日波动较高，需要检查换手和持仓成本。');
@@ -588,8 +657,105 @@ function latestAttribution(state) {
       : null,
     marketNeutralSpreadMove: round(marketNeutralSpreadMove),
     trendLockReason,
+    lockReview,
     diagnostics,
     symbols,
+  };
+}
+
+function lockedMarketNeutralHoldCounterfactual(state, reports, lockDate) {
+  const weights = state?.components?.marketNeutral?.baseWeights;
+  if (!weights || !lockDate) return null;
+  const relevant = reports.filter((item) => (
+    item.cycleDate > lockDate && item.symbolAttribution?.length
+  ));
+  if (!relevant.length) return null;
+  const symbols = Object.keys(weights);
+  const grossExposure = symbols.reduce((sum, symbol) => (
+    sum + Math.abs(Number(weights[symbol] || 0))
+  ), 0);
+  const carryRate = Number(state.profileSnapshot?.marketNeutral?.dailyCarryCostRate || 0);
+  const allocation = Number(state.profileSnapshot?.marketNeutralWeight || 0);
+  let componentEquity = 1;
+  let portfolioEquity = 1;
+  for (const report of relevant) {
+    const returns = new Map(report.symbolAttribution.map((item) => [
+      item.symbol,
+      Number(item.assetReturn || 0),
+    ]));
+    const marketReturn = symbols.reduce((sum, symbol) => (
+      sum + Number(weights[symbol] || 0) * Number(returns.get(symbol) || 0)
+    ), 0);
+    const componentReturn = marketReturn - grossExposure * carryRate;
+    componentEquity *= 1 + componentReturn;
+    portfolioEquity *= 1 + allocation * componentReturn;
+  }
+  const startingEquity = Number(relevant[0].startingEquity || state.initialCapital || 0);
+  return {
+    method: 'frozen_market_neutral_weights_after_dual_lock',
+    observations: relevant.length,
+    grossExposure: round(grossExposure),
+    componentReturn: round(componentEquity - 1),
+    portfolioReturn: round(portfolioEquity - 1),
+    portfolioPnl: round(startingEquity * (portfolioEquity - 1), 4),
+  };
+}
+
+function monthlyLockReview(state) {
+  const report = state?.latestReport;
+  if (!report || report.kind !== 'daily') return null;
+  const month = report.cycleDate.slice(0, 7);
+  const reports = dailyReports(state).filter((item) => item.cycleDate.startsWith(month));
+  const marketNeutralComponent = state.components?.marketNeutral;
+  const trendComponent = state.components?.trend;
+  const marketNeutralLockReason = marketNeutralComponent
+    && Object.hasOwn(marketNeutralComponent, 'lockReason')
+    ? marketNeutralComponent.lockReason
+    : report.settledLocks?.marketNeutral || null;
+  const trendLockReason = trendComponent && Object.hasOwn(trendComponent, 'lockReason')
+    ? trendComponent.lockReason
+    : report.settledLocks?.trend || null;
+  const bothProfitLocked = marketNeutralLockReason === 'profit' && trendLockReason === 'profit';
+  let consecutiveIdleDays = 0;
+  if (bothProfitLocked) {
+    for (let index = reports.length - 1; index >= 0; index -= 1) {
+      const item = reports[index];
+      const bothLocked = item.settledLocks?.marketNeutral === 'profit'
+        && item.settledLocks?.trend === 'profit';
+      if (!bothLocked || Number(item.modelGrossExposure || 0) !== 0) break;
+      consecutiveIdleDays += 1;
+    }
+  }
+  const firstDualLock = reports.find((item) => (
+    item.settledLocks?.marketNeutral === 'profit'
+    && item.settledLocks?.trend === 'profit'
+    && Number(item.modelGrossExposure || 0) === 0
+  ));
+  const monthToDateReturn = reports.reduce((equity, item) => (
+    equity * (1 + Number(item.dayReturn || 0))
+  ), 1) - 1;
+  return {
+    month,
+    marketNeutralLockReason,
+    trendLockReason,
+    bothProfitLocked,
+    bothProfitLockedSince: bothProfitLocked ? firstDualLock?.cycleDate || null : null,
+    consecutiveIdleDays,
+    monthToDatePnl: round(reports.reduce((sum, item) => sum + Number(item.dayPnl || 0), 0), 4),
+    monthToDateReturn: round(monthToDateReturn),
+    currentGrossExposure: round(Number(state.modelGrossExposure || 0)),
+    profitLocksEnabled: state.profileSnapshot?.marketNeutral?.monthlyProfitLock !== null
+      || state.profileSnapshot?.trend?.monthlyProfitLock !== null,
+    profitDeRisk: {
+      marketNeutral: marketNeutralComponent?.lastProfitDeRisk || null,
+      trend: trendComponent?.lastProfitDeRisk || null,
+    },
+    pendingStrategyChange: state.pendingStrategyChange || null,
+    lockedMarketNeutralHoldCounterfactual: lockedMarketNeutralHoldCounterfactual(
+      state,
+      reports,
+      firstDualLock?.cycleDate || null,
+    ),
   };
 }
 
@@ -631,8 +797,8 @@ export function buildPaperStrategyReview({
       status: 'not_started',
       generatedAt: new Date(now).toISOString(),
       baseline: {
-        id: MONTHLY_ACCURACY_PAPER_PROFILE.id,
-        name: MONTHLY_ACCURACY_PAPER_PROFILE.name,
+        id: MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE.id,
+        name: MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE.name,
         frozen: true,
         automaticParameterChanges: false,
         metrics: null,
@@ -677,6 +843,7 @@ export function buildPaperStrategyReview({
       metrics: baselineMetrics,
     },
     latestAttribution: latestAttribution(baselineState),
+    monthlyLockReview: monthlyLockReview(baselineState),
     rolling: [7, 30, 90].map((window) => rollingReview(baselineState, window)),
     candidates,
     trialCount: PAPER_SHADOW_PROFILES.length,
@@ -752,11 +919,15 @@ export async function writePaperReviewArtifacts(rootDir, review) {
     '',
     ...review.candidates.flatMap((candidate) => candidate.newsEvidence ? [
       `- ${candidate.name}新闻触发：${candidate.newsEvidence.activeDays}/${candidate.newsEvidence.evaluatedDays} 天（${percent(candidate.newsEvidence.activationRatio)}），平均实际权重 ${Number(candidate.newsEvidence.averageAppliedNewsWeightPercent || 0).toFixed(2)}%。`,
+      `  - 已结算快照：实时 ${candidate.newsEvidence.liveDays}/${candidate.newsEvidence.evaluatedDays} 天（${percent(candidate.newsEvidence.liveCoverageRatio)}），缺失 ${candidate.newsEvidence.missingDays} 天、不可用 ${candidate.newsEvidence.unavailableDays} 天、陈旧 ${candidate.newsEvidence.staleDays} 天。`,
       ...(candidate.newsEvidence.riskVetoDays
         ? [`  - 风控降敞口：${candidate.newsEvidence.riskVetoDays} 天，平均敞口缩放 ${percent(candidate.newsEvidence.averageAppliedRiskGrossExposureScale)}。`]
         : []),
       ...(candidate.newsEvidence.dominantFallbackReason
         ? [`  - 主要回退原因：${candidate.newsEvidence.dominantFallbackReason}`]
+        : []),
+      ...(candidate.latestNewsDecision
+        ? [`  - 下一周期新闻决策：${candidate.latestNewsDecision.status || 'missing'}${candidate.latestNewsDecision.signalFresh === false ? '（时效校验失败）' : ''}${candidate.latestNewsDecision.fallbackToPriceOnly ? `，价格回退：${candidate.latestNewsDecision.fallbackReason || '未记录原因'}` : ''}。`]
         : []),
     ] : []),
     '',

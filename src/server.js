@@ -14,12 +14,14 @@ import {
   paperShadowStatePath,
 } from './paper-strategy-review.js';
 import { STRATEGY_CATALOG, STRATEGY_SYMBOLS, StrategyStore } from './strategies.js';
+import { UserStore } from './user-store.js';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const publicDir = path.join(rootDir, 'public');
 const port = Number(process.env.PORT || 3173);
 const host = process.env.HOST || '127.0.0.1';
 const sessionTtlMs = Number(process.env.SESSION_TTL_MINUTES || 30) * 60_000;
+const appSessionTtlMs = Number(process.env.APP_SESSION_TTL_HOURS || 8) * 3_600_000;
 const apiBase = process.env.BINANCE_API_BASE || TESTNET_API_BASE;
 const strategyStore = new StrategyStore(path.join(rootDir, 'data', 'config', 'strategies.json'));
 const signalAccuracyStore = new SignalAccuracyStore(path.join(rootDir, 'data', 'runtime', 'signal-accuracy.json'));
@@ -34,8 +36,21 @@ const newsService = new NewsService({
   cryptoPanicPlan: process.env.CRYPTOPANIC_API_PLAN || 'growth',
 });
 const sessions = new Map();
+const appUserStore = new UserStore(
+  process.env.QUANTFLOW_USER_STORE_PATH || path.join(rootDir, 'data', 'runtime', 'users.json'),
+);
 const requestBuckets = new Map();
 const marketSignalCache = new Map();
+const defaultAppContext = {
+  userStore: appUserStore,
+  sessions: new Map(),
+  sessionTtlMs: appSessionTtlMs,
+  bootstrap: {
+    username: process.env.QUANTFLOW_ADMIN_USERNAME || '',
+    password: process.env.QUANTFLOW_ADMIN_PASSWORD || '',
+    displayName: process.env.QUANTFLOW_ADMIN_DISPLAY_NAME || '系统管理员',
+  },
+};
 
 const mimeTypes = {
   '.css': 'text/css; charset=utf-8',
@@ -64,6 +79,11 @@ function sendJson(res, status, body, headers = {}) {
     ...headers,
   });
   res.end(JSON.stringify(body));
+}
+
+function redirect(res, location) {
+  res.writeHead(302, { ...securityHeaders(), Location: location });
+  res.end();
 }
 
 async function readJson(req) {
@@ -107,6 +127,44 @@ function sessionFor(req) {
 function requireSession(req) {
   const session = sessionFor(req);
   if (!session) throw Object.assign(new Error('API 会话已失效，请重新连接'), { status: 401 });
+  return session;
+}
+
+function secureRequest(req) {
+  return Boolean(req.socket.encrypted) || req.headers['x-forwarded-proto'] === 'https';
+}
+
+function appSessionCookie(req, value, maxAgeSeconds) {
+  return `quantflow_session=${encodeURIComponent(value)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAgeSeconds}${secureRequest(req) ? '; Secure' : ''}`;
+}
+
+async function appSessionFor(req, context) {
+  const id = cookies(req).quantflow_session;
+  const session = id ? context.sessions.get(id) : null;
+  if (!session) return null;
+  if (session.expiresAt < Date.now()) {
+    context.sessions.delete(id);
+    return null;
+  }
+  const user = await context.userStore.findById(session.userId);
+  if (!user || user.status !== 'active') {
+    context.sessions.delete(id);
+    return null;
+  }
+  session.expiresAt = Date.now() + context.sessionTtlMs;
+  return { id, user };
+}
+
+async function requireAppSession(req, context) {
+  const session = await appSessionFor(req, context);
+  if (!session) throw Object.assign(new Error('请先登录系统'), { status: 401, code: 'AUTH_REQUIRED' });
+  return session;
+}
+
+function requireAdmin(session) {
+  if (session.user.role !== 'admin') {
+    throw Object.assign(new Error('仅管理员可以执行此操作'), { status: 403, code: 'ADMIN_REQUIRED' });
+  }
   return session;
 }
 
@@ -207,11 +265,104 @@ async function currentPaperPortfolio() {
   };
 }
 
-async function apiRoute(req, res, url) {
+async function apiRoute(req, res, url, appContext) {
   if (rateLimited(req)) return sendJson(res, 429, { error: '请求过于频繁，请稍后重试' });
 
   if (req.method === 'GET' && url.pathname === '/api/health') {
     return sendJson(res, 200, { status: 'ok', environment: 'spot-testnet' });
+  }
+
+  const setup = await appContext.userStore.initialize(appContext.bootstrap);
+
+  if (req.method === 'GET' && url.pathname === '/api/auth/session') {
+    const session = await appSessionFor(req, appContext);
+    return sendJson(res, 200, {
+      authenticated: Boolean(session),
+      setupRequired: setup.setupRequired,
+      user: session?.user || null,
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/auth/login') {
+    if (setup.setupRequired) {
+      throw Object.assign(new Error('系统尚未初始化管理员，请先配置启动环境变量'), {
+        status: 503,
+        code: 'SETUP_REQUIRED',
+      });
+    }
+    const body = await readJson(req);
+    const user = await appContext.userStore.authenticate(body.username, body.password);
+    const id = crypto.randomUUID();
+    appContext.sessions.set(id, { userId: user.id, expiresAt: Date.now() + appContext.sessionTtlMs });
+    return sendJson(res, 200, { authenticated: true, user }, {
+      'Set-Cookie': appSessionCookie(req, id, Math.floor(appContext.sessionTtlMs / 1000)),
+    });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/auth/logout') {
+    const id = cookies(req).quantflow_session;
+    if (id) appContext.sessions.delete(id);
+    return sendJson(res, 200, { authenticated: false }, {
+      'Set-Cookie': appSessionCookie(req, '', 0),
+    });
+  }
+
+  const appSession = await requireAppSession(req, appContext);
+
+  if (req.method === 'GET' && url.pathname === '/api/admin/users') {
+    requireAdmin(appSession);
+    return sendJson(res, 200, { users: await appContext.userStore.list() });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/admin/users') {
+    requireAdmin(appSession);
+    const body = await readJson(req);
+    const user = await appContext.userStore.create({
+      username: body.username,
+      displayName: body.displayName,
+      password: body.password,
+      role: body.role,
+    });
+    return sendJson(res, 201, { user });
+  }
+
+  const adminUserMatch = url.pathname.match(/^\/api\/admin\/users\/([a-f0-9-]+)$/);
+  if (req.method === 'PATCH' && adminUserMatch) {
+    requireAdmin(appSession);
+    const id = adminUserMatch[1];
+    const current = await appContext.userStore.findById(id);
+    if (!current) throw Object.assign(new Error('用户不存在'), { status: 404 });
+    const body = await readJson(req);
+    if (id === appSession.user.id && (body.status === 'disabled' || body.role === 'user')) {
+      throw Object.assign(new Error('不能停用自己或取消自己的管理员权限'), { status: 400 });
+    }
+    const removesActiveAdmin = current.role === 'admin' && current.status === 'active'
+      && (body.status === 'disabled' || body.role === 'user');
+    if (removesActiveAdmin && await appContext.userStore.activeAdminCount() <= 1) {
+      throw Object.assign(new Error('系统必须保留至少一名启用中的管理员'), { status: 400 });
+    }
+    const user = await appContext.userStore.update(id, {
+      ...(body.displayName !== undefined ? { displayName: body.displayName } : {}),
+      ...(body.role !== undefined ? { role: body.role } : {}),
+      ...(body.status !== undefined ? { status: body.status } : {}),
+    });
+    if (user.status === 'disabled') {
+      for (const [sessionId, session] of appContext.sessions) {
+        if (session.userId === user.id) appContext.sessions.delete(sessionId);
+      }
+    }
+    return sendJson(res, 200, { user });
+  }
+
+  const resetPasswordMatch = url.pathname.match(/^\/api\/admin\/users\/([a-f0-9-]+)\/reset-password$/);
+  if (req.method === 'POST' && resetPasswordMatch) {
+    requireAdmin(appSession);
+    const body = await readJson(req);
+    const user = await appContext.userStore.resetPassword(resetPasswordMatch[1], body.password);
+    for (const [sessionId, session] of appContext.sessions) {
+      if (session.userId === user.id && sessionId !== appSession.id) appContext.sessions.delete(sessionId);
+    }
+    return sendJson(res, 200, { user });
   }
 
   if (req.method === 'GET' && url.pathname === '/api/strategies/catalog') {
@@ -435,8 +586,18 @@ async function apiRoute(req, res, url) {
   return sendJson(res, 404, { error: '接口不存在' });
 }
 
-async function staticRoute(req, res, url) {
+async function staticRoute(req, res, url, appContext) {
   if (!['GET', 'HEAD'].includes(req.method)) return sendJson(res, 405, { error: '请求方法不支持' });
+  await appContext.userStore.initialize(appContext.bootstrap);
+  const session = await appSessionFor(req, appContext);
+  if ((url.pathname === '/' || url.pathname === '/index.html') && !session) {
+    return redirect(res, '/login.html?next=%2F');
+  }
+  if (url.pathname === '/admin.html' && !session) {
+    return redirect(res, '/login.html?next=%2Fadmin.html');
+  }
+  if (url.pathname === '/admin.html' && session.user.role !== 'admin') return redirect(res, '/');
+  if (url.pathname === '/login.html' && session) return redirect(res, session.user.role === 'admin' ? '/admin.html' : '/');
   const requested = url.pathname === '/' ? '/index.html' : url.pathname;
   const filePath = path.resolve(publicDir, `.${requested}`);
   if (!filePath.startsWith(`${publicDir}${path.sep}`)) return sendJson(res, 403, { error: '拒绝访问' });
@@ -455,18 +616,28 @@ async function staticRoute(req, res, url) {
   }
 }
 
-export const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  try {
-    if (url.pathname.startsWith('/api/')) await apiRoute(req, res, url);
-    else await staticRoute(req, res, url);
-  } catch (error) {
-    const status = error.status || 500;
-    const message = error instanceof BinanceApiError ? error.message : (status < 500 ? error.message : '服务器暂时不可用');
-    if (status >= 500) console.error('[server]', error.name, error.message);
-    sendJson(res, status, { error: message, code: error.code || null });
-  }
-});
+export function createServer(options = {}) {
+  const appContext = {
+    userStore: options.userStore || defaultAppContext.userStore,
+    sessions: options.sessions || new Map(),
+    sessionTtlMs: options.sessionTtlMs || defaultAppContext.sessionTtlMs,
+    bootstrap: options.bootstrap || defaultAppContext.bootstrap,
+  };
+  return http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    try {
+      if (url.pathname.startsWith('/api/')) await apiRoute(req, res, url, appContext);
+      else await staticRoute(req, res, url, appContext);
+    } catch (error) {
+      const status = error.status || 500;
+      const message = error instanceof BinanceApiError ? error.message : (status < 500 ? error.message : '服务器暂时不可用');
+      if (status >= 500 && status !== 503) console.error('[server]', error.name, error.message);
+      sendJson(res, status, { error: message, code: error.code || null });
+    }
+  });
+}
+
+export const server = createServer({ sessions: defaultAppContext.sessions });
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   server.listen(port, host, () => {

@@ -183,6 +183,84 @@ function sharesExplicitSymbol(left, right) {
   return left.symbols.some((symbol) => symbol !== 'MARKET' && right.symbols.includes(symbol));
 }
 
+function sharesEventScope(left, right) {
+  const leftSymbols = left.symbols.filter((symbol) => symbol !== 'MARKET');
+  const rightSymbols = right.symbols.filter((symbol) => symbol !== 'MARKET');
+  if (!leftSymbols.length || !rightSymbols.length) {
+    return leftSymbols.length === 0 && rightSymbols.length === 0;
+  }
+  return leftSymbols.some((symbol) => rightSymbols.includes(symbol));
+}
+
+function clusterNewsEvents(items) {
+  const parents = items.map((_, index) => index);
+  const find = (index) => {
+    let root = index;
+    while (parents[root] !== root) root = parents[root];
+    while (parents[index] !== index) {
+      const next = parents[index];
+      parents[index] = root;
+      index = next;
+    }
+    return root;
+  };
+  const union = (left, right) => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) parents[rightRoot] = leftRoot;
+  };
+
+  for (let left = 0; left < items.length; left += 1) {
+    const leftPublishedMs = Date.parse(items[left].publishedAt || '');
+    if (!Number.isFinite(leftPublishedMs)) continue;
+    for (let right = left + 1; right < items.length; right += 1) {
+      const rightPublishedMs = Date.parse(items[right].publishedAt || '');
+      if (!Number.isFinite(rightPublishedMs)
+        || Math.abs(rightPublishedMs - leftPublishedMs) > 12 * HOUR_MS
+        || !sharesEventScope(items[left], items[right])
+        || titleSimilarity(items[left].title, items[right].title) < 0.35) {
+        continue;
+      }
+      union(left, right);
+    }
+  }
+
+  const clusters = new Map();
+  items.forEach((item, index) => {
+    const root = find(index);
+    if (!clusters.has(root)) clusters.set(root, []);
+    clusters.get(root).push(item);
+  });
+
+  return items.map((item, index) => {
+    const members = clusters.get(find(index));
+    const eventIds = members.map((member) => member.id).sort();
+    const eventId = crypto.createHash('sha256').update(eventIds.join('|')).digest('hex').slice(0, 24);
+    const eventSourcesById = new Map(members
+      .filter((member) => member.sourceId)
+      .map((member) => [member.sourceId, member.source]));
+    const directionMembers = item.sentiment === 'neutral'
+      ? []
+      : members.filter((member) => member.sentiment === item.sentiment);
+    const directionSourcesById = new Map(directionMembers
+      .filter((member) => member.sourceId)
+      .map((member) => [member.sourceId, member.source]));
+    const directionConfirmed = directionMembers.some((member) => member.sourceTier === 'official');
+    return {
+      ...item,
+      eventId,
+      eventArticleCount: members.length,
+      eventSourceIds: [...eventSourcesById.keys()].sort(),
+      eventSources: [...eventSourcesById.values()].sort(),
+      directionConsistentSourceIds: [...directionSourcesById.keys()].sort(),
+      directionConsistentSources: [...directionSourcesById.values()].sort(),
+      directionConsistentSourceCount: directionSourcesById.size,
+      directionConfirmed,
+      directionCorroborated: directionSourcesById.size >= 2,
+    };
+  });
+}
+
 function confirmationFor(item, items, publishedMs) {
   if (item.sourceTier === 'official') {
     return {
@@ -264,7 +342,7 @@ function credibilityAssessment(item, confirmation, publishedMs) {
 }
 
 function enrichCredibility(rawItems, nowMs) {
-  const items = rawItems.map(analyzeItem);
+  const items = clusterNewsEvents(rawItems.map(analyzeItem));
   return items.map((item) => {
     const publishedMs = item.publishedAt ? Date.parse(item.publishedAt) : null;
     const corroboratingSources = new Set(items.filter((candidate) => (
@@ -301,10 +379,7 @@ function enrichCredibility(rawItems, nowMs) {
   });
 }
 
-function summaryFor(items, symbol, nowMs) {
-  const relevantItems = symbol === 'MARKET'
-    ? items
-    : items.filter((item) => item.symbols.includes(symbol) || item.symbols.includes('MARKET'));
+function aggregateSummary(relevantItems, symbol, nowMs) {
   let signedTotal = 0;
   let weightTotal = 0;
   let credibilityTotal = 0;
@@ -336,6 +411,33 @@ function summaryFor(items, symbol, nowMs) {
       evidenceStrength: item.evidenceStrength,
       sentiment: item.sentiment,
     }));
+  const freshDirectionalItems = relevantItems.filter((item) => {
+    const publishedMs = Date.parse(item.publishedAt || '');
+    if (!Number.isFinite(publishedMs)) return false;
+    const ageHours = (nowMs - publishedMs) / HOUR_MS;
+    return ageHours >= 0 && ageHours <= 72 && ['bullish', 'bearish'].includes(item.sentiment);
+  });
+  const directionalEvidence = Object.fromEntries(['bullish', 'bearish'].map((direction) => {
+    const eventItems = freshDirectionalItems.filter((item) => item.sentiment === direction);
+    const events = new Map();
+    for (const item of eventItems) {
+      if (!events.has(item.eventId)) events.set(item.eventId, []);
+      events.get(item.eventId).push(item);
+    }
+    const independentSourceIds = new Set(eventItems.flatMap(
+      (item) => item.directionConsistentSourceIds || [],
+    ));
+    return [direction, {
+      uniqueEventCount: events.size,
+      confirmedEventCount: [...events.values()].filter((members) => (
+        members.some((item) => item.directionConfirmed)
+      )).length,
+      corroboratedEventCount: [...events.values()].filter((members) => (
+        members.some((item) => item.directionCorroborated)
+      )).length,
+      independentSourceCount: independentSourceIds.size,
+    }];
+  }));
   return {
     score: Number(score.toFixed(4)),
     direction: score > 0.12 ? 'bullish' : score < -0.12 ? 'bearish' : 'neutral',
@@ -349,6 +451,36 @@ function summaryFor(items, symbol, nowMs) {
     corroboratedArticleCount,
     unconfirmedArticleCount,
     confirmationRate: relevantItems.length ? Math.round(confirmedArticleCount / relevantItems.length * 100) : 0,
+    directionalEvidence,
+  };
+}
+
+function summaryFor(items, symbol, nowMs) {
+  const relevantItems = symbol === 'MARKET'
+    ? items
+    : items.filter((item) => item.symbols.includes(symbol) || item.symbols.includes('MARKET'));
+  const summary = aggregateSummary(relevantItems, symbol, nowMs);
+  if (symbol === 'MARKET') return summary;
+
+  const symbolSpecific = aggregateSummary(
+    items.filter((item) => item.symbols.includes(symbol)),
+    symbol,
+    nowMs,
+  );
+  return {
+    ...summary,
+    symbolSpecificScore: symbolSpecific.score,
+    symbolSpecificDirection: symbolSpecific.direction,
+    symbolSpecificLabel: symbolSpecific.label,
+    symbolSpecificCredibility: symbolSpecific.credibility,
+    symbolSpecificConfidence: symbolSpecific.confidence,
+    symbolSpecificArticleCount: symbolSpecific.articleCount,
+    symbolSpecificScoredArticleCount: symbolSpecific.scoredArticleCount,
+    symbolSpecificConfirmedArticleCount: symbolSpecific.confirmedArticleCount,
+    symbolSpecificCorroboratedArticleCount: symbolSpecific.corroboratedArticleCount,
+    symbolSpecificUnconfirmedArticleCount: symbolSpecific.unconfirmedArticleCount,
+    symbolSpecificConfirmationRate: symbolSpecific.confirmationRate,
+    symbolSpecificDirectionalEvidence: symbolSpecific.directionalEvidence,
   };
 }
 
@@ -409,9 +541,11 @@ export class NewsService {
     this.refreshPromise = null;
   }
 
-  async getNews() {
+  async getNews({ forceRefresh = false } = {}) {
     const nowMs = this.now();
-    if (this.cache && nowMs - this.cache.fetchedAtMs < this.cacheTtlMs) return this.cache.payload;
+    if (!forceRefresh && this.cache && nowMs - this.cache.fetchedAtMs < this.cacheTtlMs) {
+      return this.cache.payload;
+    }
     if (this.refreshPromise) return this.refreshPromise;
     this.refreshPromise = this.#refresh(nowMs).finally(() => { this.refreshPromise = null; });
     return this.refreshPromise;

@@ -1,4 +1,5 @@
 const state = {
+  user: null,
   connected: false,
   market: null,
   currentPage: 'dashboard',
@@ -22,8 +23,26 @@ async function api(path, options = {}) {
     headers: options.body ? { 'Content-Type': 'application/json', ...options.headers } : options.headers,
   });
   const payload = await response.json().catch(() => ({}));
+  if (response.status === 401 && payload.code === 'AUTH_REQUIRED') {
+    window.location.replace(`/login.html?next=${encodeURIComponent(window.location.pathname)}`);
+    throw new Error('登录状态已失效');
+  }
   if (!response.ok) throw new Error(payload.error || '请求失败，请稍后重试');
   return payload;
+}
+
+async function loadAppSession() {
+  const session = await api('/api/auth/session');
+  if (!session.authenticated) {
+    window.location.replace('/login.html?next=%2F');
+    return false;
+  }
+  state.user = session.user;
+  $('#currentUserName').textContent = session.user.displayName;
+  $('#currentUserMeta').textContent = `${session.user.username} · ${session.user.role === 'admin' ? '管理员' : '普通用户'}`;
+  $('#currentUserAvatar').textContent = session.user.displayName.slice(0, 1);
+  $('#adminUserLink').classList.toggle('hidden', session.user.role !== 'admin');
+  return true;
 }
 
 function showToast(message, type = 'success') {
@@ -395,6 +414,13 @@ function renderPaperPortfolio(paper) {
     `;
   }).join('') || '<div class="empty-state"><span>◇</span><strong>影子候选尚未建立</strong><p>每日任务会自动创建并持续观察</p></div>';
 
+  const profitLocksDisabled = paper.monthlyProfitLockEnabled?.marketNeutral === false
+    && paper.monthlyProfitLockEnabled?.trend === false;
+  const flatPositionNote = paper.pendingStrategyChange
+    ? `${paper.pendingStrategyChange.continuousTrading ? '持续交易降风险修复' : '策略变更'}将在 ${escapeHtml(paper.pendingStrategyChange.effectiveFromCycleDate)} 09:00 生效并重算仓位`
+    : profitLocksDisabled
+      ? '盈利锁已关闭；等待最新信号形成仓位，亏损风控仍保留'
+      : '可能已触发月度锁定';
   $('#paperPositionList').innerHTML = paper.positions.length ? paper.positions.map((position) => `
     <article class="card paper-position-card ${position.side.toLowerCase()}">
       <header>
@@ -407,7 +433,7 @@ function renderPaperPortfolio(paper) {
         <span>09:00估值价 <strong>${priceFormat(position.markPrice)}</strong></span>
       </div>
     </article>
-  `).join('') : '<div class="empty-state"><span>◎</span><strong>当前为空仓</strong><p>可能已触发月度锁定</p></div>';
+  `).join('') : `<div class="empty-state"><span>◎</span><strong>当前为空仓</strong><p>${flatPositionNote}</p></div>`;
 
   const reports = (paper.reports || []).slice(-7).reverse();
   $('#paperReportList').innerHTML = reports.length ? reports.map((report) => `
@@ -745,6 +771,14 @@ $('#disconnectButton').addEventListener('click', async () => {
   }
 });
 
+$('#logoutAppButton').addEventListener('click', async () => {
+  try {
+    await api('/api/auth/logout', { method: 'POST', body: '{}' });
+  } finally {
+    window.location.replace('/login.html');
+  }
+});
+
 $('#orderForm').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!state.connected) {
@@ -844,7 +878,9 @@ $('#toggleSecret').addEventListener('click', () => {
 $$('[data-target]').forEach((button) => button.addEventListener('click', () => navigate(button.dataset.target)));
 window.addEventListener('resize', () => { if (state.market) drawChart(state.market.candles); });
 
-await Promise.all([loadSession(), loadMarket(), loadStrategies(), loadPaperPortfolio()]);
+if (await loadAppSession()) {
+  await Promise.all([loadSession(), loadMarket(), loadStrategies(), loadPaperPortfolio()]);
+}
 setInterval(() => { if (!document.hidden) loadMarket(); }, 20_000);
 setInterval(() => { if (!document.hidden && state.currentPage === 'news') loadNews(); }, 60_000);
 setInterval(() => { if (!document.hidden && state.currentPage === 'paper') loadPaperPortfolio(); }, 60_000);

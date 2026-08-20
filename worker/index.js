@@ -11,6 +11,9 @@ const NEWS_FEEDS = [
 const SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT'];
 const POSITIVE = /approve|approval|adopt|launch|partner|upgrade|inflow|rally|breakout|recovery|bullish|获批|批准|采用|上线|合作|升级|资金流入|上涨|反弹/gi;
 const NEGATIVE = /hack|exploit|breach|ban|lawsuit|charge|liquidat|outage|bankrupt|fraud|investigat|reject|delist|outflow|sell.?off|crash|bearish|slide|slump|drop|fall|tumble|plunge|decline|黑客|漏洞|攻击|被盗|禁止|诉讼|指控|清算|宕机|破产|欺诈|调查|拒绝|下架|资金流出|暴跌|利空/gi;
+const AUTH_SESSION_TTL_SECONDS = 8 * 60 * 60;
+const PASSWORD_ITERATIONS = 210_000;
+const USERNAME_PATTERN = /^[A-Za-z0-9_.-]{3,32}$/;
 let schemaReady;
 let newsCache;
 
@@ -32,6 +35,10 @@ function json(body, status = 200, headers = {}) {
   });
 }
 
+function redirect(location) {
+  return new Response(null, { status: 302, headers: { ...securityHeaders(), Location: location } });
+}
+
 function errorResponse(error) {
   const status = Number(error?.status) || 500;
   return json({ error: status < 500 ? error.message : '服务器暂时不可用', code: error?.code || null }, status);
@@ -39,6 +46,85 @@ function errorResponse(error) {
 
 function httpError(message, status = 400) {
   return Object.assign(new Error(message), { status });
+}
+
+function base64Url(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function fromBase64Url(value) {
+  const padded = String(value || '').replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(String(value || '').length / 4) * 4, '=');
+  return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+}
+
+function randomToken(length = 32) {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return base64Url(bytes);
+}
+
+async function sha256(value) {
+  return base64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))));
+}
+
+async function derivePassword(password, salt, iterations = PASSWORD_ITERATIONS) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: fromBase64Url(salt), iterations }, key, 256);
+  return base64Url(new Uint8Array(bits));
+}
+
+async function passwordHash(password) {
+  const salt = randomToken(18);
+  return { salt, hash: await derivePassword(password, salt), iterations: PASSWORD_ITERATIONS };
+}
+
+function validateUsername(value) {
+  const username = String(value || '').trim();
+  if (!USERNAME_PATTERN.test(username)) throw httpError('登录账号需为 3 到 32 位字母、数字、点、横线或下划线');
+  return username;
+}
+
+function validatePassword(value) {
+  const password = String(value || '');
+  if (password.length < 10 || password.length > 128) throw httpError('密码需为 10 到 128 个字符');
+  return password;
+}
+
+function validateDisplayName(value, fallback) {
+  const displayName = String(value || fallback || '').trim();
+  if (!displayName || displayName.length > 40) throw httpError('用户名称需为 1 到 40 个字符');
+  return displayName;
+}
+
+function validateRole(value) {
+  const role = String(value || 'user');
+  if (!['admin', 'user'].includes(role)) throw httpError('用户角色无效');
+  return role;
+}
+
+function cookies(request) {
+  return Object.fromEntries((request.headers.get('cookie') || '').split(';').map((part) => part.trim().split('=')).filter(([key]) => key).map(([key, value]) => [key, decodeURIComponent(value || '')]));
+}
+
+function authCookie(value, maxAge = AUTH_SESSION_TTL_SECONDS) {
+  return `quantflow_session=${encodeURIComponent(value)}; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=${maxAge}`;
+}
+
+function publicUser(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    username: row.username,
+    displayName: row.display_name,
+    role: row.role,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    lastLoginAt: row.last_login_at,
+    loginCount: Number(row.login_count || 0),
+  };
 }
 
 function validSymbol(value) {
@@ -186,9 +272,131 @@ async function ensureSchema(env) {
       env.DB.prepare('CREATE TABLE IF NOT EXISTS strategy_records (id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)'),
       env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_strategy_records_updated_at ON strategy_records(updated_at DESC)'),
       env.DB.prepare('CREATE TABLE IF NOT EXISTS runtime_state (state_key TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at TEXT NOT NULL)'),
+      env.DB.prepare('CREATE TABLE IF NOT EXISTS app_users (id TEXT PRIMARY KEY, username TEXT NOT NULL COLLATE NOCASE UNIQUE, display_name TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN (\'admin\', \'user\')), status TEXT NOT NULL CHECK(status IN (\'active\', \'disabled\')), password_salt TEXT NOT NULL, password_hash TEXT NOT NULL, password_iterations INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_login_at TEXT, login_count INTEGER NOT NULL DEFAULT 0)'),
+      env.DB.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_app_users_username ON app_users(username COLLATE NOCASE)'),
+      env.DB.prepare('CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES app_users(id) ON DELETE CASCADE)'),
+      env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_auth_sessions_user_id ON auth_sessions(user_id)'),
+      env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires_at ON auth_sessions(expires_at)'),
     ]).then(() => undefined).catch((error) => { schemaReady = undefined; throw error; });
   }
   await schemaReady;
+}
+
+async function ensureAuthSetup(env) {
+  await ensureSchema(env);
+  const row = await env.DB.prepare('SELECT COUNT(*) AS count FROM app_users').first();
+  if (Number(row?.count || 0) > 0) return { setupRequired: false };
+  const usernameValue = String(env.QUANTFLOW_ADMIN_USERNAME || '').trim();
+  const passwordValue = String(env.QUANTFLOW_ADMIN_PASSWORD || '');
+  if (!usernameValue || !passwordValue) return { setupRequired: true };
+  const username = validateUsername(usernameValue);
+  const password = await passwordHash(validatePassword(passwordValue));
+  const now = new Date().toISOString();
+  await env.DB.prepare('INSERT OR IGNORE INTO app_users (id, username, display_name, role, status, password_salt, password_hash, password_iterations, created_at, updated_at, login_count) VALUES (?, ?, ?, \'admin\', \'active\', ?, ?, ?, ?, ?, 0)')
+    .bind(crypto.randomUUID(), username, validateDisplayName(env.QUANTFLOW_ADMIN_DISPLAY_NAME, '系统管理员'), password.salt, password.hash, password.iterations, now, now).run();
+  return { setupRequired: false };
+}
+
+async function authSession(request, env) {
+  const token = cookies(request).quantflow_session;
+  if (!token) return null;
+  const tokenHash = await sha256(token);
+  const now = new Date().toISOString();
+  const row = await env.DB.prepare('SELECT u.id, u.username, u.display_name, u.role, u.status, u.created_at, u.updated_at, u.last_login_at, u.login_count FROM auth_sessions s JOIN app_users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?')
+    .bind(tokenHash, now).first();
+  if (!row || row.status !== 'active') {
+    await env.DB.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').bind(tokenHash).run();
+    return null;
+  }
+  const expiresAt = new Date(Date.now() + AUTH_SESSION_TTL_SECONDS * 1000).toISOString();
+  await env.DB.prepare('UPDATE auth_sessions SET expires_at = ? WHERE token_hash = ?').bind(expiresAt, tokenHash).run();
+  return { tokenHash, user: publicUser(row) };
+}
+
+async function requireAuth(request, env) {
+  const session = await authSession(request, env);
+  if (!session) throw Object.assign(httpError('请先登录系统', 401), { code: 'AUTH_REQUIRED' });
+  return session;
+}
+
+function requireAdmin(session) {
+  if (session.user.role !== 'admin') throw Object.assign(httpError('仅管理员可以执行此操作', 403), { code: 'ADMIN_REQUIRED' });
+}
+
+async function login(request, env) {
+  const body = await parseBody(request);
+  const username = String(body.username || '').trim();
+  const row = await env.DB.prepare('SELECT * FROM app_users WHERE username = ? COLLATE NOCASE').bind(username).first();
+  const matches = row && await derivePassword(String(body.password || ''), row.password_salt, Number(row.password_iterations)) === row.password_hash;
+  if (!matches) throw Object.assign(httpError('账号或密码错误', 401), { code: 'INVALID_CREDENTIALS' });
+  if (row.status !== 'active') throw Object.assign(httpError('该账号已停用，请联系管理员', 403), { code: 'USER_DISABLED' });
+  const token = randomToken();
+  const tokenHash = await sha256(token);
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + AUTH_SESSION_TTL_SECONDS * 1000).toISOString();
+  await env.DB.batch([
+    env.DB.prepare('UPDATE app_users SET last_login_at = ?, login_count = login_count + 1, updated_at = ? WHERE id = ?').bind(now, now, row.id),
+    env.DB.prepare('INSERT INTO auth_sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)').bind(tokenHash, row.id, now, expiresAt),
+  ]);
+  return { token, user: publicUser({ ...row, last_login_at: now, updated_at: now, login_count: Number(row.login_count || 0) + 1 }) };
+}
+
+async function listUsers(env) {
+  const { results } = await env.DB.prepare('SELECT id, username, display_name, role, status, created_at, updated_at, last_login_at, login_count FROM app_users ORDER BY created_at').all();
+  return results.map(publicUser);
+}
+
+async function createUser(request, env) {
+  const body = await parseBody(request);
+  const username = validateUsername(body.username);
+  const displayName = validateDisplayName(body.displayName, username);
+  const role = validateRole(body.role);
+  const password = await passwordHash(validatePassword(body.password));
+  const now = new Date().toISOString();
+  const id = crypto.randomUUID();
+  try {
+    await env.DB.prepare('INSERT INTO app_users (id, username, display_name, role, status, password_salt, password_hash, password_iterations, created_at, updated_at, login_count) VALUES (?, ?, ?, ?, \'active\', ?, ?, ?, ?, ?, 0)')
+      .bind(id, username, displayName, role, password.salt, password.hash, password.iterations, now, now).run();
+  } catch (error) {
+    if (/unique/i.test(error.message)) throw Object.assign(httpError('该登录账号已存在', 409), { code: 'USERNAME_EXISTS' });
+    throw error;
+  }
+  return publicUser({ id, username, display_name: displayName, role, status: 'active', created_at: now, updated_at: now, last_login_at: null, login_count: 0 });
+}
+
+async function updateUser(request, env, id, actor) {
+  const body = await parseBody(request);
+  const current = await env.DB.prepare('SELECT * FROM app_users WHERE id = ?').bind(id).first();
+  if (!current) throw httpError('用户不存在', 404);
+  const role = body.role === undefined ? current.role : validateRole(body.role);
+  const status = body.status === undefined ? current.status : String(body.status);
+  const displayName = body.displayName === undefined ? current.display_name : validateDisplayName(body.displayName, current.username);
+  if (!['active', 'disabled'].includes(status)) throw httpError('用户状态无效');
+  if (id === actor.user.id && (status === 'disabled' || role === 'user')) throw httpError('不能停用自己或取消自己的管理员权限');
+  if (current.role === 'admin' && current.status === 'active' && (status === 'disabled' || role === 'user')) {
+    const count = await env.DB.prepare('SELECT COUNT(*) AS count FROM app_users WHERE role = \'admin\' AND status = \'active\'').first();
+    if (Number(count?.count || 0) <= 1) throw httpError('系统必须保留至少一名启用中的管理员');
+  }
+  const now = new Date().toISOString();
+  await env.DB.prepare('UPDATE app_users SET display_name = ?, role = ?, status = ?, updated_at = ? WHERE id = ?').bind(displayName, role, status, now, id).run();
+  if (status === 'disabled') await env.DB.prepare('DELETE FROM auth_sessions WHERE user_id = ?').bind(id).run();
+  return publicUser({ ...current, display_name: displayName, role, status, updated_at: now });
+}
+
+async function resetUserPassword(request, env, id, actor) {
+  const body = await parseBody(request);
+  const current = await env.DB.prepare('SELECT * FROM app_users WHERE id = ?').bind(id).first();
+  if (!current) throw httpError('用户不存在', 404);
+  const password = await passwordHash(validatePassword(body.password));
+  const now = new Date().toISOString();
+  await env.DB.prepare('UPDATE app_users SET password_salt = ?, password_hash = ?, password_iterations = ?, updated_at = ? WHERE id = ?')
+    .bind(password.salt, password.hash, password.iterations, now, id).run();
+  if (id === actor.user.id) {
+    await env.DB.prepare('DELETE FROM auth_sessions WHERE user_id = ? AND token_hash != ?').bind(id, actor.tokenHash).run();
+  } else {
+    await env.DB.prepare('DELETE FROM auth_sessions WHERE user_id = ?').bind(id).run();
+  }
+  return publicUser({ ...current, updated_at: now });
 }
 
 async function seededJson(request, env, name, fallback) {
@@ -287,6 +495,40 @@ async function compositeSignals(symbol) {
 
 async function api(request, env, url) {
   if (request.method === 'GET' && url.pathname === '/api/health') return json({ status: 'ok', environment: 'sites-research-worker', executionMode: 'RESEARCH_ONLY' });
+  const setup = await ensureAuthSetup(env);
+  if (request.method === 'GET' && url.pathname === '/api/auth/session') {
+    const session = await authSession(request, env);
+    return json({ authenticated: Boolean(session), setupRequired: setup.setupRequired, user: session?.user || null });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/auth/login') {
+    if (setup.setupRequired) throw Object.assign(httpError('系统尚未初始化管理员，请先配置托管环境变量', 503), { code: 'SETUP_REQUIRED' });
+    const result = await login(request, env);
+    return json({ authenticated: true, user: result.user }, 200, { 'Set-Cookie': authCookie(result.token) });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/auth/logout') {
+    const token = cookies(request).quantflow_session;
+    if (token) await env.DB.prepare('DELETE FROM auth_sessions WHERE token_hash = ?').bind(await sha256(token)).run();
+    return json({ authenticated: false }, 200, { 'Set-Cookie': authCookie('', 0) });
+  }
+  const session = await requireAuth(request, env);
+  if (request.method === 'GET' && url.pathname === '/api/admin/users') {
+    requireAdmin(session);
+    return json({ users: await listUsers(env) });
+  }
+  if (request.method === 'POST' && url.pathname === '/api/admin/users') {
+    requireAdmin(session);
+    return json({ user: await createUser(request, env) }, 201);
+  }
+  const adminUserMatch = url.pathname.match(/^\/api\/admin\/users\/([a-f0-9-]+)$/);
+  if (adminUserMatch && request.method === 'PATCH') {
+    requireAdmin(session);
+    return json({ user: await updateUser(request, env, adminUserMatch[1], session) });
+  }
+  const resetPasswordMatch = url.pathname.match(/^\/api\/admin\/users\/([a-f0-9-]+)\/reset-password$/);
+  if (resetPasswordMatch && request.method === 'POST') {
+    requireAdmin(session);
+    return json({ user: await resetUserPassword(request, env, resetPasswordMatch[1], session) });
+  }
   if (request.method === 'GET' && url.pathname === '/api/market') return json(await market(validSymbol(url.searchParams.get('symbol') || 'BTCUSDT')));
   if (request.method === 'GET' && url.pathname === '/api/news') return json(await getNews());
   if (request.method === 'GET' && url.pathname === '/api/composite-signals') return json(await compositeSignals(validSymbol(url.searchParams.get('symbol') || 'BTCUSDT')));
@@ -339,6 +581,12 @@ export default {
     const url = new URL(request.url);
     try {
       if (url.pathname.startsWith('/api/')) return await api(request, env, url);
+      await ensureAuthSetup(env);
+      const session = await authSession(request, env);
+      if ((url.pathname === '/' || url.pathname === '/index.html') && !session) return redirect('/login.html?next=%2F');
+      if (url.pathname === '/admin.html' && !session) return redirect('/login.html?next=%2Fadmin.html');
+      if (url.pathname === '/admin.html' && session.user.role !== 'admin') return redirect('/');
+      if (url.pathname === '/login.html' && session) return redirect(session.user.role === 'admin' ? '/admin.html' : '/');
       const response = await env.ASSETS.fetch(request);
       return new Response(response.body, { status: response.status, headers: { ...Object.fromEntries(response.headers), ...securityHeaders() } });
     } catch (error) {

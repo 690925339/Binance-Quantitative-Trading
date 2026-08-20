@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { LONG_SHORT_RISK_PROFILES, runLongShortTrendBacktest } from '../src/long-short-trend.js';
+import {
+  calculateLongShortTrendWeights,
+  LONG_SHORT_RISK_PROFILES,
+  runLongShortTrendBacktest,
+} from '../src/long-short-trend.js';
 
 function syntheticSeries() {
   const symbols = ['AAAUSDT', 'BBBUSDT'];
@@ -137,6 +141,49 @@ test('动态杠杆配置拒绝超过 3 倍或倒置的区间', () => {
       dynamicLeverageMax: 1.5,
     }),
     /dynamicLeverageMin 不能大于 dynamicLeverageMax/,
+  );
+});
+
+test('短周期未确认下跌时拒绝滞后的趋势空头', () => {
+  const series = syntheticSeries();
+  const closesBySymbol = Object.fromEntries(Object.entries(series).map(([symbol, rows]) => [
+    symbol,
+    rows.map((row) => row.close),
+  ]));
+  const allocation = calculateLongShortTrendWeights(
+    closesBySymbol,
+    Object.keys(closesBySymbol),
+    250,
+    {
+      ...options,
+      positionMode: 'both',
+      minimumTrendVotes: 2,
+      dynamicLeverageEnabled: false,
+      shortConfirmationLookbackDays: 5,
+      shortConfirmationMinimumReturn: 0.02,
+    },
+  );
+  assert.equal(allocation.shortConfirmation.enabled, true);
+  assert.ok(allocation.shortConfirmation.rejectedSymbols.length > 0);
+  for (const symbol of allocation.shortConfirmation.rejectedSymbols) {
+    assert.equal(allocation.weights[symbol], 0);
+  }
+});
+
+test('短周期确认配置拒绝无效窗口和阈值', () => {
+  assert.throws(
+    () => runLongShortTrendBacktest(syntheticSeries(), {
+      ...options,
+      shortConfirmationLookbackDays: 1,
+    }),
+    /shortConfirmationLookbackDays/,
+  );
+  assert.throws(
+    () => runLongShortTrendBacktest(syntheticSeries(), {
+      ...options,
+      shortConfirmationMinimumReturn: -0.01,
+    }),
+    /shortConfirmationMinimumReturn/,
   );
 });
 

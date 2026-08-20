@@ -11,6 +11,8 @@ export const LONG_SHORT_TREND_DEFAULTS = Object.freeze({
   minimumTrendStrength: 0.02,
   minimumTrendVotes: null,
   minimumActiveSignals: 1,
+  shortConfirmationLookbackDays: null,
+  shortConfirmationMinimumReturn: 0,
   dynamicLeverageEnabled: false,
   dynamicLeverageMin: 1,
   dynamicLeverageMax: 1,
@@ -76,6 +78,16 @@ function mergeOptions(options) {
   }
   for (const key of ['volatilityWindowDays', 'rebalanceDays', 'minimumActiveSignals']) {
     if (!Number.isInteger(merged[key]) || merged[key] < 1) throw new Error(`${key} 必须是正整数`);
+  }
+  if (merged.shortConfirmationLookbackDays !== null
+    && (!Number.isInteger(merged.shortConfirmationLookbackDays)
+      || merged.shortConfirmationLookbackDays < 2)) {
+    throw new Error('shortConfirmationLookbackDays 必须是至少2天的整数，或设为 null');
+  }
+  if (!Number.isFinite(merged.shortConfirmationMinimumReturn)
+    || merged.shortConfirmationMinimumReturn < 0
+    || merged.shortConfirmationMinimumReturn >= 1) {
+    throw new Error('shortConfirmationMinimumReturn 必须大于等于0且小于1');
   }
   if (merged.minimumTrendVotes !== null
     && (!Number.isInteger(merged.minimumTrendVotes)
@@ -165,22 +177,46 @@ export function calculateAnnualizedVolatility(closes, index, windowDays) {
 }
 
 export function calculateLongShortTrendWeights(closesBySymbol, symbols, index, options) {
-  const candidates = symbols.map((symbol) => {
+  const shortConfirmationEnabled = Number.isInteger(options.shortConfirmationLookbackDays);
+  const evaluated = symbols.map((symbol) => {
     const trend = calculateTrendSignal(closesBySymbol[symbol], index, options);
     let signal = trend.direction;
     if (options.positionMode === 'longOnly' && signal < 0) signal = 0;
     if (options.positionMode === 'shortOnly' && signal > 0) signal = 0;
+    const shortConfirmationReturn = shortConfirmationEnabled
+      ? closesBySymbol[symbol][index]
+        / closesBySymbol[symbol][index - options.shortConfirmationLookbackDays] - 1
+      : null;
+    const shortConfirmationPassed = signal >= 0 || !shortConfirmationEnabled
+      || shortConfirmationReturn <= -options.shortConfirmationMinimumReturn;
+    const shortSignalRejected = signal < 0 && !shortConfirmationPassed;
+    if (shortSignalRejected) signal = 0;
     return {
       symbol,
       signal,
       strength: trend.strength,
       volatility: calculateAnnualizedVolatility(closesBySymbol[symbol], index, options.volatilityWindowDays),
+      shortConfirmationReturn,
+      shortSignalRejected,
     };
-  }).filter((item) => item.signal !== 0 && item.volatility > 0);
+  });
+  const candidates = evaluated.filter((item) => item.signal !== 0 && item.volatility > 0);
+  const shortConfirmation = {
+    enabled: shortConfirmationEnabled,
+    lookbackDays: shortConfirmationEnabled ? options.shortConfirmationLookbackDays : null,
+    minimumReturn: options.shortConfirmationMinimumReturn,
+    rejectedSymbols: evaluated.filter((item) => item.shortSignalRejected).map((item) => item.symbol),
+  };
 
   const weights = Object.fromEntries(symbols.map((symbol) => [symbol, 0]));
   if (candidates.length < options.minimumActiveSignals) {
-    return { weights, dynamicLeverage: 1, activeSignalCount: candidates.length, averageSignalStrength: 0 };
+    return {
+      weights,
+      dynamicLeverage: 1,
+      activeSignalCount: candidates.length,
+      averageSignalStrength: 0,
+      shortConfirmation,
+    };
   }
 
   const averageSignalStrength = mean(candidates.map((item) => item.strength));
@@ -205,6 +241,7 @@ export function calculateLongShortTrendWeights(closesBySymbol, symbols, index, o
     dynamicLeverage,
     activeSignalCount: candidates.length,
     averageSignalStrength,
+    shortConfirmation,
   };
 }
 
@@ -294,7 +331,11 @@ export function runLongShortTrendBacktest(seriesBySymbol, options = {}) {
     symbol,
     seriesBySymbol[symbol].map((item) => item.close),
   ]));
-  const warmupDays = Math.max(...settings.lookbackDays, settings.volatilityWindowDays);
+  const warmupDays = Math.max(
+    ...settings.lookbackDays,
+    settings.volatilityWindowDays,
+    settings.shortConfirmationLookbackDays || 0,
+  );
   if (dates.length <= warmupDays + 2) throw new Error(`行情长度至少需要 ${warmupDays + 3} 天`);
 
   let weights = Object.fromEntries(symbols.map((symbol) => [symbol, 0]));

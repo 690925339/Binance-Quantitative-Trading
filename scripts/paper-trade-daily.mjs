@@ -9,7 +9,8 @@ import {
   fetchPaperMarketData,
   initializePaperState,
   latestCompletePaperCycleDate,
-  MONTHLY_ACCURACY_PAPER_PROFILE,
+  migratePaperStateToContinuousDeRisk,
+  MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE,
   PaperPortfolioStore,
   paperPortfolioSnapshot,
   writePaperReportArtifacts,
@@ -25,6 +26,7 @@ import {
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const stateFile = path.join(rootDir, 'data', 'runtime', 'monthly-accuracy-paper.json');
 const paperNewsDir = path.join(rootDir, 'data', 'runtime', 'paper-news-snapshots');
+const NEWS_CAPTURE_RETRY_DELAYS_MS = Object.freeze([0, 2_000, 5_000]);
 
 function paperNewsSnapshotPath(cycleDate) {
   return path.join(paperNewsDir, `${cycleDate}.json`);
@@ -51,6 +53,94 @@ async function writePaperNewsSnapshot(cycleDate, news) {
   await fs.writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
   await fs.rename(temporary, target);
   return snapshot;
+}
+
+async function writePaperNewsCaptureAudit(cycleDate, audit) {
+  await fs.mkdir(paperNewsDir, { recursive: true });
+  const target = path.join(paperNewsDir, `${cycleDate}.capture.json`);
+  const temporary = `${target}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(temporary, `${JSON.stringify(audit, null, 2)}\n`, 'utf8');
+  await fs.rename(temporary, target);
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function paperNewsDecisionWindow(cycleDate) {
+  const startsAt = Date.parse(`${cycleDate}T01:00:00.000Z`);
+  if (!Number.isFinite(startsAt)) throw new Error(`无效新闻决策周期：${cycleDate}`);
+  return { startsAt, endsAt: startsAt + 15 * 60_000 };
+}
+
+export function isTimelyPaperNews(news, cycleDate) {
+  const capturedAt = Date.parse(news?.updatedAt || '');
+  const window = paperNewsDecisionWindow(cycleDate);
+  return news?.status === 'live'
+    && Number.isFinite(capturedAt)
+    && capturedAt >= window.startsAt
+    && capturedAt <= window.endsAt;
+}
+
+export async function captureDecisionNewsSnapshot({
+  cycleDate,
+  newsService,
+  retryDelaysMs = NEWS_CAPTURE_RETRY_DELAYS_MS,
+  waitImpl = wait,
+  writeSnapshot = writePaperNewsSnapshot,
+  writeAudit = writePaperNewsCaptureAudit,
+  now = Date.now(),
+}) {
+  const attempts = [];
+  for (let index = 0; index < retryDelaysMs.length; index += 1) {
+    const delayMs = Number(retryDelaysMs[index] || 0);
+    if (delayMs > 0) await waitImpl(delayMs);
+    try {
+      const news = await newsService.getNews({ forceRefresh: index > 0 });
+      const sourceStatus = news?.sourceStatus || [];
+      const timely = isTimelyPaperNews(news, cycleDate);
+      attempts.push({
+        attempt: index + 1,
+        requestedAt: new Date(Number(now)).toISOString(),
+        status: news?.status || 'missing',
+        updatedAt: news?.updatedAt || null,
+        timely,
+        sourceAvailability: {
+          available: sourceStatus.filter((item) => item.ok).length,
+          total: sourceStatus.length,
+        },
+      });
+      if (timely) {
+        const snapshot = await writeSnapshot(cycleDate, {
+          ...news,
+          captureAttemptCount: index + 1,
+        });
+        await writeAudit(cycleDate, {
+          paperCycleDate: cycleDate,
+          completedAt: new Date(Number(now)).toISOString(),
+          success: true,
+          attempts,
+        });
+        return snapshot;
+      }
+    } catch (error) {
+      attempts.push({
+        attempt: index + 1,
+        requestedAt: new Date(Number(now)).toISOString(),
+        status: 'error',
+        updatedAt: null,
+        timely: false,
+        error: error.message,
+      });
+    }
+  }
+  await writeAudit(cycleDate, {
+    paperCycleDate: cycleDate,
+    completedAt: new Date(Number(now)).toISOString(),
+    success: false,
+    attempts,
+  });
+  return null;
 }
 
 function parseArgs(argv) {
@@ -130,7 +220,7 @@ export async function runPaperDaily({
   notify = false,
 } = {}) {
   const latestCycleDate = latestCompletePaperCycleDate(now);
-  const profiles = [MONTHLY_ACCURACY_PAPER_PROFILE, ...PAPER_SHADOW_PROFILES];
+  const profiles = [MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE, ...PAPER_SHADOW_PROFILES];
   const stores = [
     new PaperPortfolioStore(stateFile),
     ...PAPER_SHADOW_PROFILES.map((profile) => (
@@ -155,18 +245,21 @@ export async function runPaperDaily({
       }
     }
     let latestNews = await readPaperNewsSnapshot(latestCycleDate);
-    const scheduledDecisionAt = Date.parse(`${latestCycleDate}T01:00:00.000Z`);
-    const timelyCapture = Number(now) >= scheduledDecisionAt
-      && Number(now) <= scheduledDecisionAt + 15 * 60_000;
-    if (!latestNews && timelyCapture) {
+    const decisionWindow = paperNewsDecisionWindow(latestCycleDate);
+    const timelyCapture = Number(now) >= decisionWindow.startsAt
+      && Number(now) <= decisionWindow.endsAt;
+    if ((!latestNews || !isTimelyPaperNews(latestNews, latestCycleDate)) && timelyCapture) {
       const activeNewsService = newsService || new NewsService({
         fetchImpl: newsFetchImpl,
         now: () => Number(now),
         cryptoPanicToken: process.env.CRYPTOPANIC_API_TOKEN || '',
         cryptoPanicPlan: process.env.CRYPTOPANIC_API_PLAN || 'growth',
       });
-      latestNews = await activeNewsService.getNews();
-      latestNews = await writePaperNewsSnapshot(latestCycleDate, latestNews);
+      latestNews = await captureDecisionNewsSnapshot({
+        cycleDate: latestCycleDate,
+        newsService: activeNewsService,
+        now,
+      });
     }
     if (latestNews) newsSnapshotsByCycleDate[latestCycleDate] = latestNews;
   }
@@ -187,7 +280,10 @@ export async function runPaperDaily({
       ...(baseUrl ? { baseUrl } : {}),
     });
   }
-  const states = await Promise.all(stores.map((store, index) => store.run((current) => {
+  const states = await Promise.all(stores.map((store, index) => store.run((storedState) => {
+    const current = index === 0 && storedState
+      ? migratePaperStateToContinuousDeRisk(storedState, { now })
+      : storedState;
     const profile = current?.profileSnapshot || profiles[index];
     if (current && !current.profileSnapshot) {
       current.profileSnapshot = JSON.parse(JSON.stringify(profile));

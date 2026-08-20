@@ -7,7 +7,7 @@
     <meta name="description" content="QuantFlow 币安现货测试网量化交易基础版">
     <title>QuantFlow · 币安量化测试台</title>
     <link rel="icon" href="data:,">
-    <link rel="stylesheet" href="/styles.css?v=20260717-paper-review">
+    <link rel="stylesheet" href="/styles.css?v=20260812-auth">
   </head>
   <body>
     <div class="app-shell">
@@ -191,7 +191,7 @@
             <div>
               <p class="eyebrow">DAILY PAPER PORTFOLIO</p>
               <h1>策略模拟盘</h1>
-              <p>85%横截面多空＋15%趋势，每天北京时间09:00结算。</p>
+              <p>85%横截面多空＋15%趋势；不做盈利空仓，达到月内收益阈值后保留10%敞口持续交易，每天北京时间09:00结算。</p>
             </div>
             <span class="paper-status-badge" id="paperStatus">读取中</span>
           </div>
@@ -216,7 +216,7 @@
           </div>
           <section class="card paper-review-card">
             <header>
-              <div><strong>基准参数已冻结</strong><span>候选只做前向对比，不会自动替换或加杠杆</span></div>
+              <div><strong>当前版本参数已固定</strong><span>取消盈利锁后按实际信号运行；候选不会自动替换或加杠杆</span></div>
               <b id="paperReviewCycle">--</b>
             </header>
             <div class="paper-attribution" id="paperAttribution">
@@ -302,9 +302,20 @@
         <section class="page" id="settingsPage" data-page="settings">
           <div class="page-heading">
             <p class="eyebrow">API CONNECTION</p>
-            <h1>API 设置</h1>
-            <p>凭证仅保存在服务端内存，会话到期或服务重启后自动清除。</p>
+            <h1>我的与连接</h1>
+            <p>管理当前系统账号，并配置独立的币安测试网连接。</p>
           </div>
+
+          <section class="card account-card">
+            <div class="account-identity">
+              <span id="currentUserAvatar">用</span>
+              <div><strong id="currentUserName">当前用户</strong><small id="currentUserMeta">正在读取登录信息…</small></div>
+            </div>
+            <div class="account-actions">
+              <a class="secondary-button hidden" id="adminUserLink" href="/admin.html">用户管理</a>
+              <button class="danger-button" id="logoutAppButton" type="button">退出登录</button>
+            </div>
+          </section>
 
           <section class="security-banner">
             <div class="shield">✓</div>
@@ -377,6 +388,6 @@
     </div>
 
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
-    <script type="module" src="/app.js?v=20260717-paper-review"></script>
+    <script type="module" src="/app.js?v=20260812-auth"></script>
   </body>
 </html>
