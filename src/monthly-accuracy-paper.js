@@ -117,6 +117,21 @@ function profileSnapshot(profile) {
   return JSON.parse(JSON.stringify(profile));
 }
 
+function strategyEpochStartCycleDate(state) {
+  const change = [...(state?.strategyChanges || [])]
+    .filter((item) => (
+      item?.toProfileId === state?.strategyProfileId
+      && /^\d{4}-\d{2}-\d{2}$/.test(item?.effectiveFromCycleDate || '')
+    ))
+    .sort((left, right) => (
+      right.effectiveFromCycleDate.localeCompare(left.effectiveFromCycleDate)
+    ))[0];
+  return state?.strategyEpochStartCycleDate
+    || change?.effectiveFromCycleDate
+    || state?.startCycleDate
+    || null;
+}
+
 function turnover(previousWeights, nextWeights, symbols = PAPER_SYMBOLS) {
   return symbols.reduce((sum, symbol) => (
     sum + Math.abs((nextWeights[symbol] || 0) - (previousWeights[symbol] || 0))
@@ -164,6 +179,7 @@ export function migratePaperStateToNoProfitLock(
   state.strategyProfileId = targetProfile.id;
   state.strategyName = targetProfile.name;
   state.profileSnapshot = profileSnapshot(targetProfile);
+  state.strategyEpochStartCycleDate = effectiveFromCycleDate;
   state.forceRebalanceNextCycle = true;
   state.pendingStrategyChange = change;
   state.strategyChanges = [...(state.strategyChanges || []), change];
@@ -205,6 +221,7 @@ export function migratePaperStateToContinuousDeRisk(
   state.strategyProfileId = targetProfile.id;
   state.strategyName = targetProfile.name;
   state.profileSnapshot = profileSnapshot(targetProfile);
+  state.strategyEpochStartCycleDate = effectiveFromCycleDate;
   state.forceRebalanceNextCycle = true;
   state.pendingStrategyChange = change;
   state.strategyChanges = [...(state.strategyChanges || []), change];
@@ -791,6 +808,8 @@ function reportSummary(state, report) {
     status: state.status,
     strategyType: state.strategyType,
     strategyName: state.strategyName,
+    strategyProfileId: state.strategyProfileId,
+    strategyEpochStartCycleDate: strategyEpochStartCycleDate(state),
     timezone: state.timezone,
     schedule: state.schedule,
     initialCapital: state.initialCapital,
@@ -852,6 +871,7 @@ export function initializePaperState({
     strategyType: 'monthlyAccuracyPortfolio',
     strategyName: profile.name,
     strategyProfileId: profile.id,
+    strategyEpochStartCycleDate: cycleDate,
     profileSnapshot: profileSnapshot(profile),
     timezone: 'Asia/Shanghai',
     schedule: '09:00',

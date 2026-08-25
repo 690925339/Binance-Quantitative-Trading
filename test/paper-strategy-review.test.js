@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { addUtcDays, MONTHLY_ACCURACY_PAPER_PROFILE } from '../src/monthly-accuracy-paper.js';
+import {
+  addUtcDays,
+  MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE,
+  MONTHLY_ACCURACY_PAPER_PROFILE,
+} from '../src/monthly-accuracy-paper.js';
 import {
   buildPaperStrategyReview,
   PAPER_SHADOW_PROFILES,
@@ -106,13 +110,75 @@ test('影子候选启动后保持独立ID，并在小样本阶段只采样不晋
   const review = buildPaperStrategyReview({ baselineState: baseline, shadowStates: shadows });
   assert.equal(review.baseline.frozen, true);
   assert.equal(review.promotionMode, 'MANUAL_REVIEW_ONLY');
-  assert.deepEqual(
-    review.candidates.map((item) => item.status),
-    PAPER_SHADOW_PROFILES.map(() => 'collecting'),
-  );
+  const legacyCandidates = review.candidates.filter((item) => (
+    item.profile.baselineProfileId === MONTHLY_ACCURACY_PAPER_PROFILE.id
+  ));
+  const continuousCandidate = review.candidates.find((item) => (
+    item.id === 'shadow-continuous-diversified-v1'
+  ));
+  assert.ok(legacyCandidates.every((item) => item.status === 'collecting'));
+  assert.equal(continuousCandidate.status, 'archived');
   assert.equal(review.candidates[0].metrics.observations, 2);
   assert.equal(review.latestAttribution.largestDetractor.symbol, 'ETHUSDT');
   assert.match(review.latestAttribution.diagnostics.join(' '), /横截面/);
+});
+
+test('当前v3基准只统计迁移后epoch，旧影子归档且同源分散影子重新起跑', () => {
+  const baseline = stateFor(MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE, {
+    observations: 5,
+    dailyReturn: 0.001,
+  });
+  baseline.strategyChanges = [{
+    fromProfileId: MONTHLY_ACCURACY_PAPER_PROFILE.id,
+    toProfileId: MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE.id,
+    effectiveFromCycleDate: '2024-01-04',
+  }];
+  for (const report of baseline.reports.filter((item) => item.kind === 'daily')) {
+    report.strategyProfileId = report.cycleDate >= '2024-01-04'
+      ? MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE.id
+      : MONTHLY_ACCURACY_PAPER_PROFILE.id;
+  }
+  const continuousProfile = PAPER_SHADOW_PROFILES.find((item) => (
+    item.id === 'shadow-continuous-diversified-v1'
+  ));
+  const continuousShadow = stateFor(continuousProfile, {
+    observations: 5,
+    dailyReturn: 0.0009,
+  });
+  const legacyProfile = PAPER_SHADOW_PROFILES.find((item) => (
+    item.baselineProfileId === MONTHLY_ACCURACY_PAPER_PROFILE.id
+  ));
+  const legacyShadow = stateFor(legacyProfile, {
+    observations: 5,
+    dailyReturn: 0.0011,
+  });
+
+  const review = buildPaperStrategyReview({
+    baselineState: baseline,
+    shadowStates: [continuousShadow, legacyShadow],
+  });
+  const continuousResult = review.candidates.find((item) => item.id === continuousProfile.id);
+  const legacyResult = review.candidates.find((item) => item.id === legacyProfile.id);
+  const continuousNewsResult = review.candidates.find((item) => (
+    item.id === 'shadow-continuous-news-specific-risk-v1'
+  ));
+
+  assert.equal(review.baseline.epochStartCycleDate, '2024-01-04');
+  assert.equal(review.baseline.firstFullMonth, '2024-02');
+  assert.equal(review.baseline.metrics.observations, 3);
+  assert.equal(continuousResult.status, 'collecting');
+  assert.equal(continuousResult.metrics.observations, 3);
+  assert.equal(continuousNewsResult.status, 'not_started');
+  assert.equal(continuousNewsResult.profile.newsOverlay.newsWeightMode, 'risk_veto');
+  assert.equal(
+    continuousNewsResult.profile.newsOverlay.riskEvidenceMode,
+    'confirmed_or_independent_event',
+  );
+  assert.equal(legacyResult.status, 'archived');
+  assert.equal(legacyResult.metrics.pairedExcessReturn, null);
+  assert.match(legacyResult.statusReason, /保留历史账本但停止晋级比较/);
+  assert.equal(continuousProfile.marketNeutral.monthlyProfitDeRiskScale, 0.1);
+  assert.equal(continuousProfile.marketNeutral.positionsPerSide, 2);
 });
 
 test('趋势月度锁定后复盘会提示横截面独自承担主要风险', () => {

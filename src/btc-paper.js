@@ -320,6 +320,7 @@ export function initializeBtcPaperState({
   const report = {
     id: `btc-paper-${cycleDate}-initial`,
     kind: 'initialization',
+    strategyProfileId: state.strategyProfileId,
     cycleDate,
     signalDate,
     periodStart: reportedAt,
@@ -360,7 +361,7 @@ export function advanceBtcPaperState({
   markPricesByCycleDate,
   throughCycleDate,
   now = Date.now(),
-  profile = BTC_SINGLE_ASSET_PAPER_PROFILE,
+  profile = state?.profileSnapshot ?? BTC_SINGLE_ASSET_PAPER_PROFILE,
   newsSnapshotsByCycleDate = {},
 }) {
   if (!state || state.version !== 1 || state.strategyProfileId !== profile.id) {
@@ -421,6 +422,7 @@ export function advanceBtcPaperState({
     const report = {
       id: `btc-paper-${cycleDate}`,
       kind: 'daily',
+      strategyProfileId: state.strategyProfileId,
       cycleDate,
       signalDate,
       periodStart: state.latestReport?.periodEnd || null,

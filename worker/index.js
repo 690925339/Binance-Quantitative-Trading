@@ -405,14 +405,108 @@ async function seededJson(request, env, name, fallback) {
   return response.json();
 }
 
+function validCycleDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) ? String(value) : null;
+}
+
+function validTimestamp(value) {
+  const timestamp = Date.parse(String(value || ''));
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+export function runtimeStateFreshness(state) {
+  if (!state || typeof state !== 'object') {
+    return { cycleDate: null, timestamp: null, reportCount: 0 };
+  }
+  const reports = Array.isArray(state.reports) ? state.reports : [];
+  const cycleDates = [
+    state.lastCycleDate,
+    state.cycleDate,
+    state.latestReport?.cycleDate,
+    ...reports.map((report) => report?.cycleDate),
+  ].map(validCycleDate).filter(Boolean);
+  const timestamps = [
+    state.updatedAt,
+    state.reportedAt,
+    state.generatedAt,
+    state.reviewedAt,
+    state.latestReport?.reportedAt,
+    ...reports.map((report) => report?.reportedAt),
+  ].map(validTimestamp).filter((value) => value !== null);
+  return {
+    cycleDate: cycleDates.length ? cycleDates.sort().at(-1) : null,
+    timestamp: timestamps.length ? Math.max(...timestamps) : null,
+    reportCount: reports.length,
+  };
+}
+
+export function selectRuntimeState(stored, seeded) {
+  if (!stored || typeof stored !== 'object') {
+    return { state: seeded, source: 'seed', shouldPersist: true };
+  }
+  if (!seeded || typeof seeded !== 'object') {
+    return { state: stored, source: 'stored', shouldPersist: false };
+  }
+  const storedFreshness = runtimeStateFreshness(stored);
+  const seedFreshness = runtimeStateFreshness(seeded);
+  let seedIsNewer = false;
+  if (seedFreshness.cycleDate && storedFreshness.cycleDate) {
+    seedIsNewer = seedFreshness.cycleDate > storedFreshness.cycleDate;
+    if (seedFreshness.cycleDate === storedFreshness.cycleDate) {
+      const seedSnapshotVersion = Number(seeded.runtimeSnapshotVersion || 0);
+      const storedSnapshotVersion = Number(stored.runtimeSnapshotVersion || 0);
+      const seedIsNotOlderByTime = seedFreshness.timestamp !== null
+        && (storedFreshness.timestamp === null
+          || seedFreshness.timestamp >= storedFreshness.timestamp);
+      seedIsNewer = seedSnapshotVersion > storedSnapshotVersion
+        && seedIsNotOlderByTime;
+      if (!seedIsNewer) {
+        seedIsNewer = seedSnapshotVersion === storedSnapshotVersion
+          && seedFreshness.timestamp !== null
+          && (storedFreshness.timestamp === null
+            || seedFreshness.timestamp > storedFreshness.timestamp);
+      }
+      if (!seedIsNewer && seedFreshness.timestamp === storedFreshness.timestamp) {
+        seedIsNewer = seedFreshness.reportCount > storedFreshness.reportCount;
+      }
+    }
+  } else if (seedFreshness.cycleDate) {
+    seedIsNewer = true;
+  } else if (!storedFreshness.cycleDate && seedFreshness.timestamp !== null) {
+    seedIsNewer = storedFreshness.timestamp === null
+      || seedFreshness.timestamp > storedFreshness.timestamp;
+  }
+  return seedIsNewer
+    ? { state: seeded, source: 'seed', shouldPersist: true }
+    : { state: stored, source: 'stored', shouldPersist: false };
+}
+
+export function combinePaperPortfolioState(paper, btcPortfolio, optimizationReview) {
+  return {
+    ...(paper || {}),
+    btcPortfolio: btcPortfolio || null,
+    optimizationReview: optimizationReview || null,
+  };
+}
+
 async function readState(request, env, key, seedName, fallback) {
   await ensureSchema(env);
   const row = await env.DB.prepare('SELECT payload FROM runtime_state WHERE state_key = ?').bind(key).first();
-  if (row?.payload) return JSON.parse(row.payload);
   const seeded = await seededJson(request, env, seedName, fallback);
-  await env.DB.prepare('INSERT OR REPLACE INTO runtime_state (state_key, payload, updated_at) VALUES (?, ?, ?)')
-    .bind(key, JSON.stringify(seeded), new Date().toISOString()).run();
-  return seeded;
+  let stored = null;
+  if (row?.payload) {
+    try {
+      stored = JSON.parse(row.payload);
+    } catch {
+      stored = null;
+    }
+  }
+  const selected = selectRuntimeState(stored, seeded);
+  if (selected.shouldPersist) {
+    await env.DB.prepare('INSERT OR REPLACE INTO runtime_state (state_key, payload, updated_at) VALUES (?, ?, ?)')
+      .bind(key, JSON.stringify(selected.state), new Date().toISOString()).run();
+  }
+  return selected.state;
 }
 
 async function catalog(request, env) {
@@ -566,11 +660,12 @@ async function api(request, env, url) {
     return json({ strategy: await createStrategy(new Request(request.url, { method: 'POST', body: JSON.stringify({ ...source, name: `${source.name} 副本`, enabled: false }) }), env) }, 201);
   }
   if (request.method === 'GET' && url.pathname === '/api/paper-portfolio') {
-    const [paper, btcPortfolio] = await Promise.all([
+    const [paper, btcPortfolio, optimizationReview] = await Promise.all([
       readState(request, env, 'paper-portfolio', 'paper-portfolio', { status: 'not_started', reports: [], positions: [] }),
       readState(request, env, 'btc-paper', 'btc-paper', { status: 'not_started', reports: [], positions: [], strategyType: 'btcSingleAssetTrend' }),
+      readState(request, env, 'paper-review', 'paper-review', { status: 'not_started', candidates: [] }),
     ]);
-    return json({ ...paper, btcPortfolio });
+    return json(combinePaperPortfolioState(paper, btcPortfolio, optimizationReview));
   }
   if (request.method === 'GET' && url.pathname === '/api/paper-portfolio/btc') return json(await readState(request, env, 'btc-paper', 'btc-paper', { status: 'not_started', reports: [], positions: [], strategyType: 'btcSingleAssetTrend' }));
   if (request.method === 'GET' && url.pathname === '/api/paper-portfolio/review') return json(await readState(request, env, 'paper-review', 'paper-review', { status: 'not_started', candidates: [] }));

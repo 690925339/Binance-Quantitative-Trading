@@ -1,6 +1,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { btcPaperSnapshot } from '../src/btc-paper.js';
+import { paperPortfolioSnapshot } from '../src/monthly-accuracy-paper.js';
+import {
+  buildPaperStrategyReview,
+  PAPER_SHADOW_PROFILES,
+  paperShadowStatePath,
+} from '../src/paper-strategy-review.js';
 import { STRATEGY_CATALOG, STRATEGY_SYMBOLS } from '../src/strategies.js';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -15,6 +22,19 @@ async function copyIfPresent(source, target) {
   }
 }
 
+async function readJsonIfPresent(filePath) {
+  try {
+    return JSON.parse(await fs.readFile(filePath, 'utf8'));
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function writeJson(filePath, value) {
+  await fs.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+}
+
 await fs.rm(distDir, { recursive: true, force: true });
 await fs.mkdir(path.join(distDir, 'server'), { recursive: true });
 await fs.mkdir(seedDir, { recursive: true });
@@ -25,16 +45,34 @@ await fs.writeFile(
   `${JSON.stringify({ strategies: Object.values(STRATEGY_CATALOG), symbols: STRATEGY_SYMBOLS })}\n`,
   'utf8',
 );
-await copyIfPresent(
+const baselineState = await readJsonIfPresent(
   path.join(rootDir, 'data', 'runtime', 'monthly-accuracy-paper.json'),
-  path.join(seedDir, 'paper-portfolio.json'),
 );
-await copyIfPresent(
-  path.join(rootDir, 'data', 'runtime', 'paper-review.json'),
-  path.join(seedDir, 'paper-review.json'),
-);
-await copyIfPresent(
+const btcState = await readJsonIfPresent(
   path.join(rootDir, 'data', 'runtime', 'btc-single-asset-paper.json'),
-  path.join(seedDir, 'btc-paper.json'),
 );
+const shadowStates = await Promise.all(PAPER_SHADOW_PROFILES.map((profile) => (
+  readJsonIfPresent(paperShadowStatePath(rootDir, profile.id))
+)));
+if (baselineState) {
+  await writeJson(
+    path.join(seedDir, 'paper-portfolio.json'),
+    { ...paperPortfolioSnapshot(baselineState), runtimeSnapshotVersion: 2 },
+  );
+  await writeJson(
+    path.join(seedDir, 'paper-review.json'),
+    buildPaperStrategyReview({ baselineState, shadowStates }),
+  );
+} else {
+  await copyIfPresent(
+    path.join(rootDir, 'data', 'runtime', 'paper-review.json'),
+    path.join(seedDir, 'paper-review.json'),
+  );
+}
+if (btcState) {
+  await writeJson(
+    path.join(seedDir, 'btc-paper.json'),
+    { ...btcPaperSnapshot(btcState), runtimeSnapshotVersion: 2 },
+  );
+}
 console.log('Sites Worker artifact ready.');

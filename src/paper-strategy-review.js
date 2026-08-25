@@ -13,6 +13,7 @@ const BASELINE_ENTRY_REPORT_KIND = 'initialization';
 function frozenProfile(overrides) {
   return Object.freeze({
     ...MONTHLY_ACCURACY_PAPER_PROFILE,
+    baselineProfileId: MONTHLY_ACCURACY_PAPER_PROFILE.id,
     ...overrides,
     marketNeutral: Object.freeze({
       ...MONTHLY_ACCURACY_PAPER_PROFILE.marketNeutral,
@@ -20,6 +21,25 @@ function frozenProfile(overrides) {
     }),
     trend: Object.freeze({
       ...MONTHLY_ACCURACY_PAPER_PROFILE.trend,
+      ...(overrides.trend || {}),
+    }),
+    newsOverlay: overrides.newsOverlay
+      ? Object.freeze({ ...overrides.newsOverlay })
+      : null,
+  });
+}
+
+function frozenContinuousProfile(overrides) {
+  return Object.freeze({
+    ...MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE,
+    baselineProfileId: MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE.id,
+    ...overrides,
+    marketNeutral: Object.freeze({
+      ...MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE.marketNeutral,
+      ...(overrides.marketNeutral || {}),
+    }),
+    trend: Object.freeze({
+      ...MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE.trend,
       ...(overrides.trend || {}),
     }),
     newsOverlay: overrides.newsOverlay
@@ -129,6 +149,41 @@ export const PAPER_SHADOW_PROFILES = Object.freeze([
     },
     cashWeight: 0,
   }),
+  frozenContinuousProfile({
+    id: 'shadow-continuous-diversified-v1',
+    name: '持续降风险分散影子｜横截面每侧2个',
+    role: 'risk_adjusted',
+    hypothesis: '在持续交易降风险v3上，只把横截面多空腿从每侧1个扩到2个，验证能否降低单腿挤压风险。',
+    marketNeutral: {
+      positionsPerSide: 2,
+    },
+    cashWeight: 0,
+  }),
+  frozenContinuousProfile({
+    id: 'shadow-continuous-news-specific-risk-v1',
+    name: '持续降风险新闻影子｜标的事件冲突减仓',
+    role: 'news_specific_risk_veto',
+    hypothesis: '在持续交易降风险v3上，只启用标的专属高可信新闻冲突减仓，检验新闻风控能否降低错误方向的尾部损失。',
+    newsOverlay: {
+      enabled: true,
+      newsWeightMode: 'risk_veto',
+      priceSignalWeight: 100,
+      newsSignalWeight: 0,
+      minimumNewsCredibility: 75,
+      minimumNewsConfidence: 65,
+      minimumConfirmedArticles: 1,
+      minimumAbsoluteScore: 0.12,
+      riskVetoEnabled: true,
+      riskSignalScope: 'symbol_specific',
+      riskEvidenceMode: 'confirmed_or_independent_event',
+      riskMinimumCredibility: 65,
+      riskMinimumConfidence: 50,
+      riskMinimumArticleCount: 3,
+      riskMinimumAbsoluteScore: 0.15,
+      riskGrossExposureScale: 0.75,
+    },
+    cashWeight: 0,
+  }),
 ]);
 
 export const PAPER_REVIEW_POLICY = Object.freeze({
@@ -218,6 +273,35 @@ function dailyReports(state) {
   return (state?.reports || [])
     .filter((report) => report.kind === 'daily')
     .sort((left, right) => left.cycleDate.localeCompare(right.cycleDate));
+}
+
+function firstFullMonthAfter(cycleDate) {
+  const date = new Date(`${cycleDate}T00:00:00.000Z`);
+  date.setUTCMonth(date.getUTCMonth() + 1, 1);
+  return date.toISOString().slice(0, 7);
+}
+
+function currentProfileEpoch(state) {
+  const change = [...(state?.strategyChanges || [])]
+    .filter((item) => (
+      item?.toProfileId === state?.strategyProfileId
+      && /^\d{4}-\d{2}-\d{2}$/.test(item?.effectiveFromCycleDate || '')
+    ))
+    .sort((left, right) => (
+      right.effectiveFromCycleDate.localeCompare(left.effectiveFromCycleDate)
+    ))[0] || null;
+  const startCycleDate = change?.effectiveFromCycleDate || state?.startCycleDate || null;
+  const reports = dailyReports(state).filter((report) => {
+    if (report.strategyProfileId) return report.strategyProfileId === state.strategyProfileId;
+    return !startCycleDate || report.cycleDate >= startCycleDate;
+  });
+  return {
+    startCycleDate,
+    firstFullMonth: startCycleDate
+      ? firstFullMonthAfter(startCycleDate)
+      : state?.firstFullMonth,
+    reports,
+  };
 }
 
 function initializationReturn(state) {
@@ -457,19 +541,70 @@ function newsEvidence(state, acceptedDates) {
 }
 
 function matchedCandidate(baselineState, candidateState, profile, trialCount) {
+  const baselineProfileId = profile.baselineProfileId || MONTHLY_ACCURACY_PAPER_PROFILE.id;
+  const effectiveProfile = candidateState?.profileSnapshot || profile;
+  const profileSummary = {
+    baselineProfileId,
+    marketNeutralWeight: effectiveProfile.marketNeutralWeight,
+    trendWeight: effectiveProfile.trendWeight,
+    cashWeight: effectiveProfile.cashWeight || 0,
+    positionsPerSide: effectiveProfile.marketNeutral.positionsPerSide,
+    newsOverlay: effectiveProfile.newsOverlay || null,
+  };
+  if (baselineProfileId !== baselineState.strategyProfileId) {
+    const reports = candidateState ? dailyReports(candidateState) : [];
+    const acceptedDates = new Set(reports.map((report) => report.cycleDate));
+    const candidateMetrics = candidateState
+      ? calculateMetrics(
+        reports.map((report) => ({ date: report.cycleDate, return: report.dayReturn })),
+        {
+          entryReturn: initializationReturn(candidateState),
+          firstFullMonth: candidateState.firstFullMonth,
+          latestDate: candidateState.lastCycleDate,
+          exposure: exposureMetrics(candidateState, acceptedDates),
+        },
+      )
+      : null;
+    return {
+      id: effectiveProfile.id,
+      name: effectiveProfile.name,
+      role: effectiveProfile.role,
+      hypothesis: effectiveProfile.hypothesis,
+      profile: profileSummary,
+      startedAt: candidateState?.startedAt || null,
+      startCycleDate: candidateState?.startCycleDate || null,
+      lastCycleDate: candidateState?.lastCycleDate || null,
+      status: 'archived',
+      statusReason: `候选基于 ${baselineProfileId}；当前正式基准为 ${baselineState.strategyProfileId}，保留历史账本但停止晋级比较。`,
+      metrics: candidateMetrics ? {
+        ...candidateMetrics,
+        pairedExcessReturn: null,
+        baselineTotalReturn: null,
+        baselineAnnualizedReturn: null,
+        baselineMaxDrawdown: null,
+        bootstrapP: null,
+        adjustedBootstrapP: null,
+      } : null,
+      newsEvidence: candidateState && effectiveProfile.newsOverlay?.enabled
+        ? newsEvidence(candidateState, acceptedDates)
+        : null,
+      latestNewsDecision: candidateState?.components?.marketNeutral?.lastNewsDecision || null,
+    };
+  }
   if (!candidateState) {
     return {
       id: profile.id,
       name: profile.name,
       role: profile.role,
       hypothesis: profile.hypothesis,
+      profile: profileSummary,
       status: 'not_started',
       statusReason: '影子账本尚未建立。',
     };
   }
-  const effectiveProfile = candidateState.profileSnapshot || profile;
   const candidateByDate = new Map(dailyReports(candidateState).map((report) => [report.cycleDate, report]));
-  const baselineByDate = new Map(dailyReports(baselineState).map((report) => [report.cycleDate, report]));
+  const baselineByDate = new Map(currentProfileEpoch(baselineState).reports
+    .map((report) => [report.cycleDate, report]));
   const firstPairedDate = addUtcDays(candidateState.startCycleDate, 1);
   const dates = [...candidateByDate.keys()]
     .filter((date) => date >= firstPairedDate && baselineByDate.has(date))
@@ -508,13 +643,7 @@ function matchedCandidate(baselineState, candidateState, profile, trialCount) {
     name: effectiveProfile.name,
     role: effectiveProfile.role,
     hypothesis: effectiveProfile.hypothesis,
-    profile: {
-      marketNeutralWeight: effectiveProfile.marketNeutralWeight,
-      trendWeight: effectiveProfile.trendWeight,
-      cashWeight: effectiveProfile.cashWeight || 0,
-      positionsPerSide: effectiveProfile.marketNeutral.positionsPerSide,
-      newsOverlay: effectiveProfile.newsOverlay || null,
-    },
+    profile: profileSummary,
     startedAt: candidateState.startedAt,
     startCycleDate: candidateState.startCycleDate,
     lastCycleDate: candidateState.lastCycleDate,
@@ -759,8 +888,8 @@ function monthlyLockReview(state) {
   };
 }
 
-function rollingReview(state, window) {
-  const reports = dailyReports(state).slice(-window);
+function rollingReview(state, window, availableReports = currentProfileEpoch(state).reports) {
+  const reports = availableReports.slice(-window);
   const metrics = calculateMetrics(
     reports.map((report) => ({ date: report.cycleDate, return: report.dayReturn })),
     {
@@ -814,14 +943,18 @@ export function buildPaperStrategyReview({
     state.strategyProfileId,
     state,
   ]));
-  const baselineReports = dailyReports(baselineState);
+  const baselineEpoch = currentProfileEpoch(baselineState);
+  const baselineReports = baselineEpoch.reports;
+  const baselineDates = new Set(baselineReports.map((report) => report.cycleDate));
   const baselineMetrics = calculateMetrics(
     baselineReports.map((report) => ({ date: report.cycleDate, return: report.dayReturn })),
     {
-      entryReturn: initializationReturn(baselineState),
-      firstFullMonth: baselineState.firstFullMonth,
-      latestDate: baselineState.lastCycleDate,
-      exposure: exposureMetrics(baselineState),
+      entryReturn: baselineEpoch.startCycleDate === baselineState.startCycleDate
+        ? initializationReturn(baselineState)
+        : 0,
+      firstFullMonth: baselineEpoch.firstFullMonth,
+      latestDate: baselineReports.at(-1)?.cycleDate || baselineState.lastCycleDate,
+      exposure: exposureMetrics(baselineState, baselineDates),
     },
   );
   const candidates = PAPER_SHADOW_PROFILES.map((profile) => matchedCandidate(
@@ -840,11 +973,17 @@ export function buildPaperStrategyReview({
       name: baselineState.strategyName,
       frozen: true,
       automaticParameterChanges: false,
+      epochStartCycleDate: baselineEpoch.startCycleDate,
+      firstFullMonth: baselineEpoch.firstFullMonth,
       metrics: baselineMetrics,
     },
     latestAttribution: latestAttribution(baselineState),
     monthlyLockReview: monthlyLockReview(baselineState),
-    rolling: [7, 30, 90].map((window) => rollingReview(baselineState, window)),
+    rolling: [7, 30, 90].map((window) => rollingReview(
+      baselineState,
+      window,
+      baselineReports,
+    )),
     candidates,
     trialCount: PAPER_SHADOW_PROFILES.length,
     policy: PAPER_REVIEW_POLICY,

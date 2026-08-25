@@ -387,11 +387,14 @@ fieldset { padding: 0; border: 0; margin: 0; }
 .paper-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .paper-status-badge { flex: 0 0 auto; margin-top: 5px; padding: 5px 8px; color: var(--muted); border: 1px solid var(--line); border-radius: 7px; background: var(--surface-soft); font-size: 8px; }
 .paper-status-badge.running { color: var(--positive); border-color: rgba(55, 214, 140, .22); background: var(--positive-soft); }
+.paper-status-badge.delayed { color: var(--warning); border-color: rgba(255, 184, 77, .3); background: rgba(255, 184, 77, .1); }
 .paper-equity-card { padding: 15px; }
 .paper-equity-card > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.paper-equity-card > header > div, .btc-paper-card > header > div { min-width: 0; }
 .paper-equity-card > header span, .paper-equity-card > header small { display: block; }
 .paper-equity-card > header span { font-size: 9px; font-weight: 700; }
 .paper-equity-card > header small { margin-top: 3px; color: var(--muted-2); font-size: 7px; }
+.paper-equity-card > header small.delayed, .btc-paper-card > header small.delayed { color: var(--warning); font-weight: 700; line-height: 1.45; overflow-wrap: anywhere; }
 .paper-refresh-button { border: 1px solid var(--line); padding: 7px 9px; color: var(--muted); border-radius: 8px; background: var(--surface-soft); font-size: 8px; }
 .paper-equity-card > strong { display: block; margin-top: 17px; font-size: 28px; font-variant-numeric: tabular-nums; }
 .btc-paper-title { align-items: center; }
@@ -440,6 +443,8 @@ fieldset { padding: 0; border: 0; margin: 0; }
 .paper-candidate-card > header > b { flex: 0 0 auto; padding: 4px 6px; color: var(--muted); border-radius: 6px; background: var(--surface); font-size: 7px; }
 .paper-candidate-card.promotable > header > b { color: var(--positive); background: var(--positive-soft); }
 .paper-candidate-card.reject > header > b { color: var(--negative); background: var(--negative-soft); }
+.paper-candidate-card.archived { opacity: .72; }
+.paper-candidate-card.archived > header > b { color: var(--muted-2); background: var(--surface); }
 .paper-candidate-metrics { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-top: 9px; }
 .paper-candidate-metrics span { min-width: 0; color: var(--muted-2); font-size: 7px; }
 .paper-candidate-metrics strong { display: block; margin-top: 3px; color: var(--text); font-size: 8px; }

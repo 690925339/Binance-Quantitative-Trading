@@ -144,6 +144,7 @@ test('持续交易降风险迁移保留历史和已有亏损锁并从下一周�
   assert.equal(state.equity, equityBefore);
   assert.equal(JSON.stringify(state.reports), reportsBefore);
   assert.equal(state.pendingStrategyChange.effectiveFromCycleDate, '2026-07-18');
+  assert.equal(state.strategyEpochStartCycleDate, '2026-07-18');
   assert.equal(state.pendingStrategyChange.continuousTrading, true);
   assert.equal(state.forceRebalanceNextCycle, true);
 });
@@ -432,6 +433,8 @@ test('每日推进只结算未处理日期，重复执行保持幂等', () => {
   const equityAfterFirstRun = state.equity;
   assert.equal(state.lastCycleDate, '2026-07-17');
   assert.equal(state.latestReport.kind, 'daily');
+  assert.equal(state.latestReport.strategyProfileId, MONTHLY_ACCURACY_PAPER_PROFILE.id);
+  assert.equal(state.latestReport.strategyEpochStartCycleDate, '2026-07-16');
   assert.ok(Number.isFinite(state.latestReport.dayPnl));
   assert.equal(
     Number(state.latestReport.symbolAttribution
@@ -677,10 +680,10 @@ test('标的专属新闻风控不会被只有泛市场依据的综合分数触�
 
 test('未来新闻风控候选可要求同方向官方确认或独立多源事件证据', () => {
   const baseProfile = PAPER_SHADOW_PROFILES
-    .find((item) => item.id === 'shadow-news-specific-risk-v1');
+    .find((item) => item.id === 'shadow-continuous-news-specific-risk-v1');
   const profile = JSON.parse(JSON.stringify(baseProfile));
   profile.id = 'research-event-evidence';
-  profile.newsOverlay.riskEvidenceMode = 'confirmed_or_independent_event';
+  assert.equal(profile.newsOverlay.riskEvidenceMode, 'confirmed_or_independent_event');
   const directionalEvidence = {
     bullish: { uniqueEventCount: 0, confirmedEventCount: 0, corroboratedEventCount: 0, independentSourceCount: 0 },
     bearish: { uniqueEventCount: 1, confirmedEventCount: 0, corroboratedEventCount: 0, independentSourceCount: 1 },

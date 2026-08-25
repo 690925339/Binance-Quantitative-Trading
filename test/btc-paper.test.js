@@ -143,3 +143,44 @@ test('BTC模拟盘保留1.5%月度亏损保护并实际平仓', () => {
   assert.equal(state.latestReport.settledLockReason, 'loss');
   assert.ok(state.latestReport.tradingCost > 0);
 });
+
+test('BTC模拟盘后续推进默认沿用初始化时冻结的策略快照', () => {
+  const series = btcSeries('2025-11-01', '2026-07-17');
+  const profile = {
+    ...BTC_SINGLE_ASSET_PAPER_PROFILE,
+    id: 'btc-single-asset-frozen-test-v1',
+    name: 'BTC冻结配置测试',
+    tradingCostRate: 0,
+    dailyCarryCostRate: 0,
+    monthlyLossLimit: 0.50,
+    monthlyProfitDeRiskThreshold: 0.50,
+    trend: {
+      ...BTC_SINGLE_ASSET_PAPER_PROFILE.trend,
+      maxGrossExposure: 0.05,
+      maxAssetExposure: 0.05,
+      tradingCostRate: 0,
+      dailyCarryCostRate: 0,
+    },
+  };
+  const state = initializeBtcPaperState({
+    seriesBySymbol: series,
+    cycleDate: '2026-07-16',
+    markPrice: 45_000,
+    profile,
+  });
+
+  assert.equal(state.latestReport.strategyProfileId, profile.id);
+  assert.ok(Math.abs(state.weight) <= 0.05);
+
+  advanceBtcPaperState({
+    state,
+    seriesBySymbol: series,
+    markPricesByCycleDate: { '2026-07-17': { BTCUSDT: 45_100 } },
+    throughCycleDate: '2026-07-17',
+  });
+
+  assert.equal(state.latestReport.strategyProfileId, profile.id);
+  assert.equal(state.latestReport.tradingCost, 0);
+  assert.equal(state.latestReport.carryCost, 0);
+  assert.ok(Math.abs(state.weight) <= 0.05);
+});

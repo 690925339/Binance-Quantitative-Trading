@@ -334,6 +334,44 @@ function beijingTime(value, options = {}) {
   }).format(new Date(value));
 }
 
+function expectedPaperCycleDate(now = Date.now()) {
+  const beijingNow = new Date(Number(now) + 8 * 60 * 60 * 1000);
+  let cycleDate = Date.UTC(
+    beijingNow.getUTCFullYear(),
+    beijingNow.getUTCMonth(),
+    beijingNow.getUTCDate(),
+  );
+  if (beijingNow.getUTCHours() < 9) cycleDate -= 24 * 60 * 60 * 1000;
+  return new Date(cycleDate).toISOString().slice(0, 10);
+}
+
+function paperCycleFreshness(paper, now = Date.now()) {
+  const expectedCycleDate = expectedPaperCycleDate(now);
+  const lastCycleDate = paper?.lastCycleDate || paper?.latestReport?.cycleDate || null;
+  return {
+    expectedCycleDate,
+    lastCycleDate,
+    delayed: paper?.status === 'running'
+      && (!/^\d{4}-\d{2}-\d{2}$/.test(String(lastCycleDate || ''))
+        || lastCycleDate < expectedCycleDate),
+  };
+}
+
+function renderPaperStatus(element, paper, runningLabel) {
+  const running = paper?.status === 'running';
+  const freshness = paperCycleFreshness(paper);
+  element.textContent = running ? (freshness.delayed ? '数据延迟' : runningLabel) : '尚未启动';
+  element.classList.toggle('running', running && !freshness.delayed);
+  element.classList.toggle('delayed', freshness.delayed);
+  return { running, ...freshness };
+}
+
+function paperUpdatedText(prefix, value, freshness) {
+  const settledAt = `${prefix} ${beijingTime(value)}`;
+  if (!freshness.delayed) return settledAt;
+  return `数据延迟 · 截至 ${freshness.lastCycleDate || '无日报'}，应到 ${freshness.expectedCycleDate} · ${settledAt}`;
+}
+
 function paperCandidateStatus(status) {
   return {
     not_started: '尚未启动',
@@ -341,16 +379,17 @@ function paperCandidateStatus(status) {
     reviewable: '可诊断',
     promotable: '待人工晋级复核',
     reject: '停止晋级',
+    archived: '历史归档',
   }[status] || status || '--';
 }
 
 function renderBtcPaperPortfolio(paper) {
   if (!$('#btcPaperCard')) return;
-  const running = paper?.status === 'running';
-  $('#btcPaperStatus').textContent = running ? '独立运行中' : '尚未启动';
-  $('#btcPaperStatus').classList.toggle('running', running);
+  const freshness = renderPaperStatus($('#btcPaperStatus'), paper, '独立运行中');
+  const running = freshness.running;
   if (!running) {
     $('#btcPaperUpdatedAt').textContent = '等待建立模拟仓';
+    $('#btcPaperUpdatedAt').classList.remove('delayed');
     $('#btcPaperEquity').textContent = '--';
     $('#btcPaperPnl').textContent = '累计 --';
     $('#btcPaperPnl').className = 'neutral';
@@ -366,7 +405,12 @@ function renderBtcPaperPortfolio(paper) {
   const signal = paper.signal || paper.latestReport?.signal || null;
   const newsRisk = paper.newsRisk || paper.latestReport?.newsRisk || null;
   const deRisk = paper.profitDeRisk || paper.latestReport?.profitDeRisk || null;
-  $('#btcPaperUpdatedAt').textContent = `更新于 ${beijingTime(paper.updatedAt || paper.latestReport?.reportedAt)}`;
+  $('#btcPaperUpdatedAt').textContent = paperUpdatedText(
+    '更新于',
+    paper.updatedAt || paper.latestReport?.reportedAt,
+    freshness,
+  );
+  $('#btcPaperUpdatedAt').classList.toggle('delayed', freshness.delayed);
   $('#btcPaperEquity').textContent = `${Number(paper.equity).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT`;
   $('#btcPaperPnl').textContent = `累计 ${formatPnl(paper.totalPnl)} · ${percentFormat(paper.totalReturn)}`;
   $('#btcPaperPnl').className = pnlClass(paper.totalPnl);
@@ -405,10 +449,11 @@ function renderBtcPaperPortfolio(paper) {
 
 function renderPaperPortfolio(paper) {
   renderBtcPaperPortfolio(paper?.btcPortfolio);
-  const running = paper.status === 'running';
-  $('#paperStatus').textContent = running ? '模拟运行中' : '尚未启动';
-  $('#paperStatus').classList.toggle('running', running);
+  const freshness = renderPaperStatus($('#paperStatus'), paper, '模拟运行中');
+  const running = freshness.running;
   if (!running) {
+    $('#paperUpdatedAt').textContent = '等待首次结算';
+    $('#paperUpdatedAt').classList.remove('delayed');
     $('#paperEquity').textContent = '--';
     $('#paperDayPnl').textContent = '等待首次启动';
     $('#paperTotalPnl').textContent = '--';
@@ -424,7 +469,12 @@ function renderPaperPortfolio(paper) {
   }
 
   const latest = paper.latestReport;
-  $('#paperUpdatedAt').textContent = `结算于 ${beijingTime(latest?.reportedAt || paper.updatedAt)}`;
+  $('#paperUpdatedAt').textContent = paperUpdatedText(
+    '结算于',
+    latest?.reportedAt || paper.updatedAt,
+    freshness,
+  );
+  $('#paperUpdatedAt').classList.toggle('delayed', freshness.delayed);
   $('#paperEquity').textContent = `${Number(paper.equity).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USDT`;
   $('#paperDayPnl').textContent = `当日 ${formatPnl(latest?.dayPnl)} · ${percentFormat(latest?.dayReturn)}`;
   $('#paperDayPnl').className = `paper-day-pnl ${pnlClass(latest?.dayPnl)}`;
