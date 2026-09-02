@@ -398,6 +398,8 @@ function renderBtcPaperPortfolio(paper) {
     $('#btcPaperLeverage').textContent = '--';
     $('#btcPaperRisk').textContent = '--';
     $('#btcPaperNews').textContent = '--';
+    $('#btcPaperAccuracy').textContent = '--';
+    $('#btcPaperProfitableDays').textContent = '--';
     $('#btcPaperReports').innerHTML = '<div class="empty-state"><span>₿</span><strong>BTC模拟盘尚未启动</strong><p>每日任务会使用实时进场价建立独立账本</p></div>';
     return;
   }
@@ -437,6 +439,12 @@ function renderBtcPaperPortfolio(paper) {
     : newsRisk?.eligible
       ? `${newsRisk.direction === 'bullish' ? '利多' : '利空'}证据合格，无持仓冲突`
       : '未形成合格的BTC专属事件证据';
+  $('#btcPaperAccuracy').textContent = paper.accuracy?.directionalObservations
+    ? `${paper.accuracy.directionalHits}/${paper.accuracy.directionalObservations} · ${percentFormat(paper.accuracy.directionalHitRate)}`
+    : '--';
+  $('#btcPaperProfitableDays').textContent = paper.accuracy?.observations
+    ? `${paper.accuracy.profitableDays}/${paper.accuracy.observations} · ${percentFormat(paper.accuracy.profitableDayRatio)}`
+    : '--';
   const reports = (paper.reports || []).slice(-3).reverse();
   $('#btcPaperReports').innerHTML = reports.map((report) => `
     <article>
@@ -486,6 +494,7 @@ function renderPaperPortfolio(paper) {
 
   const review = paper.optimizationReview;
   const attribution = review?.latestAttribution;
+  const accuracy = review?.accuracyComparison;
   $('#paperReviewCycle').textContent = review?.cycleDate || '--';
   $('#paperAttribution').innerHTML = attribution ? `
     <div class="paper-attribution-summary">
@@ -495,6 +504,8 @@ function renderPaperPortfolio(paper) {
       <div><span>最大贡献</span><b class="positive">${escapeHtml(attribution.largestContributor.symbol)} ${formatPnl(attribution.largestContributor.totalPricePnl)}</b></div>
       <div><span>多空价差变化</span><b class="${pnlClass(attribution.marketNeutralSpreadMove)}">${percentFormat(attribution.marketNeutralSpreadMove)}</b></div>
       <div><span>成本占绝对盈亏</span><b>${percentFormat(attribution.costShareOfAbsolutePnl)}</b></div>
+      <div><span>当前v3方向命中</span><b>${accuracy?.currentStrategy?.directionalObservations ? `${accuracy.currentStrategy.directionalHits}/${accuracy.currentStrategy.directionalObservations} · ${percentFormat(accuracy.currentStrategy.directionalHitRate)}` : '--'}</b></div>
+      <div><span>v3前方向命中</span><b>${accuracy?.previousStrategies?.directionalObservations ? `${accuracy.previousStrategies.directionalHits}/${accuracy.previousStrategies.directionalObservations} · ${percentFormat(accuracy.previousStrategies.directionalHitRate)}` : '--'}</b></div>
     </div>
     <ul>${attribution.diagnostics.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
   ` : '<div class="empty-state"><span>△</span><strong>等待首个完整日报</strong><p>首日只建仓，次日开始生成归因</p></div>';
@@ -517,6 +528,8 @@ function renderPaperPortfolio(paper) {
           <span>完整月份 <strong>${metrics?.fullMonthCount || 0} / 3</strong></span>
           <span>相对基准 <strong class="${pnlClass(metrics?.pairedExcessReturn)}">${metrics?.pairedExcessReturn !== null && metrics?.pairedExcessReturn !== undefined ? percentFormat(metrics.pairedExcessReturn) : '--'}</strong></span>
           <span>最大回撤 <strong>${metrics ? percentFormat(metrics.maxDrawdown) : '--'}</strong></span>
+          <span>方向命中 <strong>${metrics?.directionalObservations ? `${metrics.directionalHits}/${metrics.directionalObservations} · ${percentFormat(metrics.directionalHitRate)}` : '--'}</strong></span>
+          <span>盈利日 <strong>${metrics?.observations ? `${metrics.profitableDays}/${metrics.observations} · ${percentFormat(metrics.profitableDayRatio)}` : '--'}</strong></span>
         </div>
         ${newsNote}
         <p>${escapeHtml(candidate.statusReason)}</p>

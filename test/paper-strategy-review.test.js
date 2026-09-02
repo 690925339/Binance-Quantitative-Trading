@@ -166,6 +166,11 @@ test('当前v3基准只统计迁移后epoch，旧影子归档且同源分散影�
   assert.equal(review.baseline.epochStartCycleDate, '2024-01-04');
   assert.equal(review.baseline.firstFullMonth, '2024-02');
   assert.equal(review.baseline.metrics.observations, 3);
+  assert.equal(review.baseline.metrics.directionalHits, 3);
+  assert.equal(review.baseline.metrics.directionalHitRate, 1);
+  assert.equal(review.accuracyComparison.previousStrategies.directionalHits, 2);
+  assert.equal(review.accuracyComparison.currentStrategy.directionalHits, 3);
+  assert.match(review.accuracyComparison.definition.directionalHitRate, /价格盈亏/);
   assert.equal(continuousResult.status, 'collecting');
   assert.equal(continuousResult.metrics.observations, 3);
   assert.equal(continuousNewsResult.status, 'not_started');
@@ -179,6 +184,32 @@ test('当前v3基准只统计迁移后epoch，旧影子归档且同源分散影�
   assert.match(legacyResult.statusReason, /保留历史账本但停止晋级比较/);
   assert.equal(continuousProfile.marketNeutral.monthlyProfitDeRiskScale, 0.1);
   assert.equal(continuousProfile.marketNeutral.positionsPerSide, 2);
+});
+
+test('正确率对比会区分空仓持平日、活跃盈利日和价格方向命中', () => {
+  const baseline = stateFor(MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE, {
+    observations: 3,
+    dailyReturn: 0.001,
+  });
+  const reports = baseline.reports.filter((item) => item.kind === 'daily');
+  reports[1].dayReturn = 0;
+  reports[1].dayPnl = 0;
+  reports[1].pricePnl = 0;
+  reports[1].modelGrossExposure = 0;
+  reports[1].positions = [];
+  reports[2].dayReturn = -0.001;
+  reports[2].dayPnl = -10;
+  reports[2].pricePnl = -10;
+
+  const review = buildPaperStrategyReview({ baselineState: baseline, shadowStates: [] });
+  const metrics = review.accuracyComparison.currentStrategy;
+  assert.equal(metrics.observations, 3);
+  assert.equal(metrics.profitableDays, 1);
+  assert.equal(metrics.activeDayObservations, 2);
+  assert.equal(metrics.activeProfitableDays, 1);
+  assert.equal(metrics.directionalObservations, 2);
+  assert.equal(metrics.directionalHits, 1);
+  assert.equal(metrics.directionalHitRate, 0.5);
 });
 
 test('趋势月度锁定后复盘会提示横截面独自承担主要风险', () => {

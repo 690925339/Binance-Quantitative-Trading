@@ -275,6 +275,23 @@ function dailyReports(state) {
     .sort((left, right) => left.cycleDate.localeCompare(right.cycleDate));
 }
 
+function reportMetricPoint(report) {
+  const startingEquity = Number(report?.startingEquity || 0);
+  const pricePnl = Number(report?.pricePnl || 0);
+  const directionalReturn = startingEquity > 0
+    ? pricePnl / startingEquity
+    : pricePnl;
+  const active = Math.abs(pricePnl) > 1e-12
+    || Number(report?.carryCost || 0) > 0
+    || Number(report?.tradingCost || 0) > 0;
+  return {
+    date: report.cycleDate,
+    return: Number(report.dayReturn),
+    directionalReturn,
+    active,
+  };
+}
+
 function firstFullMonthAfter(cycleDate) {
   const date = new Date(`${cycleDate}T00:00:00.000Z`);
   date.setUTCMonth(date.getUTCMonth() + 1, 1);
@@ -347,6 +364,16 @@ function calculateMetrics(series, {
   exposure = {},
 } = {}) {
   const returns = series.map((item) => Number(item.return));
+  const activeSeries = series.filter((item) => item.active !== false);
+  const directionalSeries = series.filter((item) => (
+    Number.isFinite(Number(item.directionalReturn))
+    && Math.abs(Number(item.directionalReturn)) > 1e-12
+  ));
+  const profitableDays = returns.filter((value) => value > 0).length;
+  const activeProfitableDays = activeSeries.filter((item) => Number(item.return) > 0).length;
+  const directionalHits = directionalSeries.filter((item) => (
+    Number(item.directionalReturn) > 0
+  )).length;
   let equity = 1 + Number(entryReturn || 0);
   let peak = 1;
   let maxDrawdown = Math.min(0, equity / peak - 1);
@@ -375,8 +402,20 @@ function calculateMetrics(series, {
       : null,
     maxDrawdown: round(maxDrawdown),
     worstDayReturn: returns.length ? round(Math.min(...returns)) : null,
-    profitableDayRatio: returns.length
-      ? round(returns.filter((value) => value > 0).length / returns.length)
+    profitableDays,
+    profitableDayRatio: returns.length ? round(profitableDays / returns.length) : null,
+    activeDayObservations: activeSeries.length,
+    activeProfitableDays,
+    activeProfitableDayRatio: activeSeries.length
+      ? round(activeProfitableDays / activeSeries.length)
+      : null,
+    directionalObservations: directionalSeries.length,
+    directionalHits,
+    directionalHitRate: directionalSeries.length
+      ? round(directionalHits / directionalSeries.length)
+      : null,
+    directionalWilson95Lower: directionalSeries.length
+      ? round(wilsonLower(directionalHits, directionalSeries.length))
       : null,
     expectedShortfall95: round(expectedShortfall95(returns)),
     completeMonths: fullMonths,
@@ -387,6 +426,56 @@ function calculateMetrics(series, {
       ? round(wilsonLower(positiveMonths, fullMonths.length))
       : null,
     ...exposure,
+  };
+}
+
+function accuracySummary(reports) {
+  const metrics = calculateMetrics(reports.map(reportMetricPoint));
+  return {
+    startCycleDate: reports[0]?.cycleDate || null,
+    endCycleDate: reports.at(-1)?.cycleDate || null,
+    observations: metrics.observations,
+    totalReturn: metrics.totalReturn,
+    profitableDays: metrics.profitableDays,
+    profitableDayRatio: metrics.profitableDayRatio,
+    activeDayObservations: metrics.activeDayObservations,
+    activeProfitableDays: metrics.activeProfitableDays,
+    activeProfitableDayRatio: metrics.activeProfitableDayRatio,
+    directionalObservations: metrics.directionalObservations,
+    directionalHits: metrics.directionalHits,
+    directionalHitRate: metrics.directionalHitRate,
+    directionalWilson95Lower: metrics.directionalWilson95Lower,
+  };
+}
+
+function buildAccuracyComparison(state, baselineEpoch) {
+  const reports = dailyReports(state);
+  const priorReports = baselineEpoch.startCycleDate
+    ? reports.filter((report) => report.cycleDate < baselineEpoch.startCycleDate)
+    : [];
+  const latestMonth = state.lastCycleDate?.slice(0, 7) || null;
+  const completedMonths = [...new Set(reports
+    .map((report) => report.cycleDate.slice(0, 7))
+    .filter((month) => month >= state.firstFullMonth && month < latestMonth))]
+    .sort();
+  const latestFullMonth = completedMonths.at(-1) || null;
+  const latestFullMonthReports = latestFullMonth
+    ? reports.filter((report) => report.cycleDate.startsWith(latestFullMonth))
+    : [];
+  return {
+    definition: {
+      profitableDayRatio: '净收益大于0的结算日占全部结算日比例；空仓持平日计入分母。',
+      activeProfitableDayRatio: '净收益大于0的结算日占实际发生价格盈亏或成本的活跃日比例。',
+      directionalHitRate: '持仓价格盈亏大于0的活跃结算日占比；不含交易费和持仓费。',
+      positiveMonthRatio: '完整自然月净收益大于0的月份比例。',
+    },
+    allSimulation: accuracySummary(reports),
+    previousStrategies: accuracySummary(priorReports),
+    currentStrategy: accuracySummary(baselineEpoch.reports),
+    latestFullMonth: latestFullMonth ? {
+      month: latestFullMonth,
+      ...accuracySummary(latestFullMonthReports),
+    } : null,
   };
 }
 
@@ -556,7 +645,7 @@ function matchedCandidate(baselineState, candidateState, profile, trialCount) {
     const acceptedDates = new Set(reports.map((report) => report.cycleDate));
     const candidateMetrics = candidateState
       ? calculateMetrics(
-        reports.map((report) => ({ date: report.cycleDate, return: report.dayReturn })),
+        reports.map(reportMetricPoint),
         {
           entryReturn: initializationReturn(candidateState),
           firstFullMonth: candidateState.firstFullMonth,
@@ -610,14 +699,8 @@ function matchedCandidate(baselineState, candidateState, profile, trialCount) {
     .filter((date) => date >= firstPairedDate && baselineByDate.has(date))
     .sort();
   const acceptedDates = new Set(dates);
-  const candidateSeries = dates.map((date) => ({
-    date,
-    return: Number(candidateByDate.get(date).dayReturn),
-  }));
-  const benchmarkSeries = dates.map((date) => ({
-    date,
-    return: Number(baselineByDate.get(date).dayReturn),
-  }));
+  const candidateSeries = dates.map((date) => reportMetricPoint(candidateByDate.get(date)));
+  const benchmarkSeries = dates.map((date) => reportMetricPoint(baselineByDate.get(date)));
   const latestDate = dates.at(-1) || candidateState.lastCycleDate;
   const candidateMetrics = calculateMetrics(candidateSeries, {
     entryReturn: initializationReturn(candidateState),
@@ -891,7 +974,7 @@ function monthlyLockReview(state) {
 function rollingReview(state, window, availableReports = currentProfileEpoch(state).reports) {
   const reports = availableReports.slice(-window);
   const metrics = calculateMetrics(
-    reports.map((report) => ({ date: report.cycleDate, return: report.dayReturn })),
+    reports.map(reportMetricPoint),
     {
       firstFullMonth: state.firstFullMonth,
       latestDate: reports.at(-1)?.cycleDate,
@@ -947,7 +1030,7 @@ export function buildPaperStrategyReview({
   const baselineReports = baselineEpoch.reports;
   const baselineDates = new Set(baselineReports.map((report) => report.cycleDate));
   const baselineMetrics = calculateMetrics(
-    baselineReports.map((report) => ({ date: report.cycleDate, return: report.dayReturn })),
+    baselineReports.map(reportMetricPoint),
     {
       entryReturn: baselineEpoch.startCycleDate === baselineState.startCycleDate
         ? initializationReturn(baselineState)
@@ -977,6 +1060,7 @@ export function buildPaperStrategyReview({
       firstFullMonth: baselineEpoch.firstFullMonth,
       metrics: baselineMetrics,
     },
+    accuracyComparison: buildAccuracyComparison(baselineState, baselineEpoch),
     latestAttribution: latestAttribution(baselineState),
     monthlyLockReview: monthlyLockReview(baselineState),
     rolling: [7, 30, 90].map((window) => rollingReview(
@@ -1022,6 +1106,27 @@ export async function writePaperReviewArtifacts(rootDir, review) {
     `- 目标边界：${review.targetDisclaimer || ''}`,
     '',
   ];
+  const accuracy = review.accuracyComparison;
+  if (accuracy) {
+    const accuracyRows = [
+      ['全部模拟期', accuracy.allSimulation],
+      ['v3前策略', accuracy.previousStrategies],
+      ['当前v3', accuracy.currentStrategy],
+      [accuracy.latestFullMonth ? `最近完整月 ${accuracy.latestFullMonth.month}` : '最近完整月', accuracy.latestFullMonth],
+    ];
+    lines.push(
+      '## 正确率对比',
+      '',
+      '| 区间 | 净收益 | 盈利日 | 活跃盈利日 | 方向命中 |',
+      '| --- | ---: | ---: | ---: | ---: |',
+      ...accuracyRows.map(([label, item]) => (
+        `| ${label} | ${percent(item?.totalReturn)} | ${item?.profitableDays ?? 0}/${item?.observations ?? 0}（${percent(item?.profitableDayRatio)}） | ${item?.activeProfitableDays ?? 0}/${item?.activeDayObservations ?? 0}（${percent(item?.activeProfitableDayRatio)}） | ${item?.directionalHits ?? 0}/${item?.directionalObservations ?? 0}（${percent(item?.directionalHitRate)}） |`
+      )),
+      '',
+      '> 盈利日比例、方向命中率和盈利月比例是不同口径；短样本不用于自动晋级。',
+      '',
+    );
+  }
   if (attribution) {
     lines.push(
       '## 最新损益归因',

@@ -472,10 +472,17 @@ export function btcPaperSnapshot(state) {
       schedule: '09:00',
       positions: [],
       reports: [],
+      accuracy: null,
       nextReportAt: null,
     };
   }
   const nextCycleDate = addUtcDays(state.lastCycleDate, 1);
+  const dailyReports = (state.reports || []).filter((report) => report.kind === 'daily');
+  const directionalReports = dailyReports.filter((report) => (
+    Math.abs(Number(report.pricePnl || 0)) > 1e-12
+  ));
+  const profitableDays = dailyReports.filter((report) => Number(report.dayReturn) > 0).length;
+  const directionalHits = directionalReports.filter((report) => Number(report.pricePnl) > 0).length;
   return {
     mode: state.mode,
     status: state.status,
@@ -508,6 +515,16 @@ export function btcPaperSnapshot(state) {
     signal: state.lastSignal,
     newsRisk: state.lastNewsRisk,
     profitDeRisk: state.lastProfitDeRisk,
+    accuracy: {
+      observations: dailyReports.length,
+      profitableDays,
+      profitableDayRatio: dailyReports.length ? round(profitableDays / dailyReports.length) : null,
+      directionalObservations: directionalReports.length,
+      directionalHits,
+      directionalHitRate: directionalReports.length
+        ? round(directionalHits / directionalReports.length)
+        : null,
+    },
     updatedAt: state.updatedAt,
   };
 }

@@ -43,6 +43,14 @@ test('BTC单币策略只建立BTC仓位并沿用多周期动态趋势参数', ()
   assert.equal(snapshot.positions[0].side, 'LONG');
   assert.ok(snapshot.modelGrossExposure > 0);
   assert.ok(snapshot.modelGrossExposure <= 1);
+  assert.deepEqual(snapshot.accuracy, {
+    observations: 0,
+    profitableDays: 0,
+    profitableDayRatio: null,
+    directionalObservations: 0,
+    directionalHits: 0,
+    directionalHitRate: null,
+  });
   assert.equal(snapshot.latestReport.pricePnl, 0);
   assert.ok(snapshot.latestReport.tradingCost > 0);
   assert.match(snapshot.latestReport.notes.join(' '), /不回填/);
