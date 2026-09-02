@@ -66,6 +66,26 @@ test('同一周期的标准快照版本升级可修复旧D1响应结构', () => 
   assert.equal(selectRuntimeState(stored, seeded).shouldPersist, true);
 });
 
+test('同一结算时点的正确率快照v3会替换缺少统计字段的v2', () => {
+  const stored = {
+    ...state('2026-09-02', '2026-09-02T01:00:02.000Z'),
+    runtimeSnapshotVersion: 2,
+  };
+  const seeded = {
+    ...structuredClone(stored),
+    runtimeSnapshotVersion: 3,
+    accuracy: {
+      observations: 13,
+      directionalHits: 7,
+      directionalObservations: 12,
+      directionalHitRate: 7 / 12,
+    },
+  };
+  const selected = selectRuntimeState(stored, seeded);
+  assert.equal(selected.state, seeded);
+  assert.equal(selected.shouldPersist, true);
+});
+
 test('同周期高版本seed不得覆盖结算时间更晚的D1账本', () => {
   const stored = {
     ...state('2026-08-25', '2026-08-25T01:10:00.000Z'),

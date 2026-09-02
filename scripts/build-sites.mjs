@@ -13,6 +13,7 @@ import { STRATEGY_CATALOG, STRATEGY_SYMBOLS } from '../src/strategies.js';
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const distDir = path.join(rootDir, 'dist');
 const seedDir = path.join(distDir, 'seed');
+const RUNTIME_SNAPSHOT_VERSION = 3;
 
 async function copyIfPresent(source, target) {
   try {
@@ -57,7 +58,10 @@ const shadowStates = await Promise.all(PAPER_SHADOW_PROFILES.map((profile) => (
 if (baselineState) {
   await writeJson(
     path.join(seedDir, 'paper-portfolio.json'),
-    { ...paperPortfolioSnapshot(baselineState), runtimeSnapshotVersion: 2 },
+    {
+      ...paperPortfolioSnapshot(baselineState),
+      runtimeSnapshotVersion: RUNTIME_SNAPSHOT_VERSION,
+    },
   );
   await writeJson(
     path.join(seedDir, 'paper-review.json'),
@@ -72,7 +76,10 @@ if (baselineState) {
 if (btcState) {
   await writeJson(
     path.join(seedDir, 'btc-paper.json'),
-    { ...btcPaperSnapshot(btcState), runtimeSnapshotVersion: 2 },
+    {
+      ...btcPaperSnapshot(btcState),
+      runtimeSnapshotVersion: RUNTIME_SNAPSHOT_VERSION,
+    },
   );
 }
 console.log('Sites Worker artifact ready.');
