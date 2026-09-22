@@ -4,10 +4,28 @@ import {
   captureDecisionNewsSnapshot,
   isTimelyPaperNews,
   paperNewsDecisionWindow,
+  pendingPaperNewsStates,
 } from '../scripts/paper-trade-daily.mjs';
 
 const CYCLE_DATE = '2026-07-16';
 const NOW = Date.parse('2026-07-16T01:05:00.000Z');
+
+test('仅BTC待结算时仍要求采集新闻，已结算时不重复采集', () => {
+  const current = { lastCycleDate: CYCLE_DATE };
+  const previous = { lastCycleDate: '2026-07-15' };
+  const args = { profiles: [{ newsOverlay: { enabled: true } }], states: [current], latestCycleDate: CYCLE_DATE };
+  assert.deepEqual(pendingPaperNewsStates({ ...args, btcState: previous }), [previous]);
+  assert.deepEqual(pendingPaperNewsStates({ ...args, btcState: current }), []);
+  assert.deepEqual(pendingPaperNewsStates({ ...args, btcState: null }), [null]);
+});
+
+test('新闻待结算列表忽略已停用的组合盘和全部影子盘', () => {
+  const previous = { lastCycleDate: '2026-07-13' };
+  assert.deepEqual(pendingPaperNewsStates({
+    profiles: [{}, { newsOverlay: { enabled: true } }, { newsOverlay: { enabled: true } }],
+    states: [previous, previous, null], btcState: { lastCycleDate: CYCLE_DATE }, latestCycleDate: CYCLE_DATE,
+  }), []);
+});
 
 test('新闻决策窗口严格限定在北京时间09:00至09:15', () => {
   const window = paperNewsDecisionWindow(CYCLE_DATE);

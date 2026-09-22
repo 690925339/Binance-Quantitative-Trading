@@ -7,13 +7,9 @@ import { BinanceApiError, BinanceClient, TESTNET_API_BASE } from './binance-clie
 import { SignalAccuracyStore } from './accuracy-leverage.js';
 import { calculateCompositeSignal, calculatePriceTrendScore, COMPOSITE_STRATEGY_PROFILES } from './composite-strategies.js';
 import { NewsService } from './news-service.js';
-import { PaperPortfolioStore, paperPortfolioSnapshot } from './monthly-accuracy-paper.js';
+import { PaperPortfolioStore } from './monthly-accuracy-paper.js';
 import { btcPaperSnapshot, btcPaperStatePath } from './btc-paper.js';
-import {
-  buildPaperStrategyReview,
-  PAPER_SHADOW_PROFILES,
-  paperShadowStatePath,
-} from './paper-strategy-review.js';
+import { activePaperSnapshot } from '../worker/paper-scope.js';
 import { STRATEGY_CATALOG, STRATEGY_SYMBOLS, StrategyStore } from './strategies.js';
 import { UserStore } from './user-store.js';
 
@@ -26,13 +22,7 @@ const appSessionTtlMs = Number(process.env.APP_SESSION_TTL_HOURS || 8) * 3_600_0
 const apiBase = process.env.BINANCE_API_BASE || TESTNET_API_BASE;
 const strategyStore = new StrategyStore(path.join(rootDir, 'data', 'config', 'strategies.json'));
 const signalAccuracyStore = new SignalAccuracyStore(path.join(rootDir, 'data', 'runtime', 'signal-accuracy.json'));
-const paperPortfolioStore = new PaperPortfolioStore(
-  path.join(rootDir, 'data', 'runtime', 'monthly-accuracy-paper.json'),
-);
 const btcPaperPortfolioStore = new PaperPortfolioStore(btcPaperStatePath(rootDir));
-const paperShadowStores = PAPER_SHADOW_PROFILES.map((profile) => (
-  new PaperPortfolioStore(paperShadowStatePath(rootDir, profile.id))
-));
 const newsService = new NewsService({
   cryptoPanicToken: process.env.CRYPTOPANIC_API_TOKEN || '',
   cryptoPanicPlan: process.env.CRYPTOPANIC_API_PLAN || 'growth',
@@ -257,16 +247,7 @@ function rateLimited(req) {
 }
 
 async function currentPaperPortfolio() {
-  const [baselineState, btcState, shadowStates] = await Promise.all([
-    paperPortfolioStore.read(),
-    btcPaperPortfolioStore.read(),
-    Promise.all(paperShadowStores.map((store) => store.read())),
-  ]);
-  return {
-    ...paperPortfolioSnapshot(baselineState),
-    optimizationReview: buildPaperStrategyReview({ baselineState, shadowStates }),
-    btcPortfolio: btcPaperSnapshot(btcState),
-  };
+  return activePaperSnapshot(btcPaperSnapshot(await btcPaperPortfolioStore.read()));
 }
 
 async function apiRoute(req, res, url, appContext) {
@@ -400,7 +381,7 @@ async function apiRoute(req, res, url, appContext) {
     if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > 365) {
       throw Object.assign(new Error('日报数量必须在 1 到 365 之间'), { status: 400 });
     }
-    const snapshot = paperPortfolioSnapshot(await paperPortfolioStore.read());
+    const snapshot = btcPaperSnapshot(await btcPaperPortfolioStore.read());
     return sendJson(res, 200, {
       reports: snapshot.reports.slice(-Number(rawLimit)).reverse(),
     });

@@ -97,6 +97,61 @@ function stateFor(profile, {
   };
 }
 
+test('共同结算期比较排除不同启动日的初始化费用且不改写账本', () => {
+  const profile = PAPER_SHADOW_PROFILES.find(p => p.id === 'shadow-continuous-diversified-capped-v1');
+  const baseline = stateFor(MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE, {
+    observations: 5, dailyReturn: 0.001, entryReturn: -0.05,
+  });
+  const candidate = stateFor(profile, {
+    startCycleDate: '2024-01-03', observations: 3, dailyReturn: 0.001, entryReturn: -0.01,
+  });
+  const before = JSON.stringify([baseline, candidate]);
+  const result = buildPaperStrategyReview({ baselineState: baseline, shadowStates: [candidate] })
+    .candidates.find(p => p.id === profile.id);
+  assert.equal(result.metrics.observations, 3);
+  assert.equal(result.metrics.totalReturn, 0.003003);
+  assert.equal(result.metrics.baselineTotalReturn, 0.003003);
+  assert.equal(result.metrics.pairedExcessReturn, 0);
+  assert.equal(result.comparison.initializationFeesIncluded, false);
+  assert.equal(result.comparison.candidateInitializationCostReturn, -0.01);
+  assert.equal(result.comparison.baselineInitializationCostReturn, -0.05);
+  assert.equal(result.comparison.startCycleDate, '2024-01-04');
+  assert.equal(JSON.stringify([baseline, candidate]), before);
+});
+
+test('价差风控与同日对照配对而非旧主盘，对照不参与候选试验数量', () => {
+  const profile = PAPER_SHADOW_PROFILES.find(p => p.comparisonControlId);
+  const controlProfile = PAPER_SHADOW_PROFILES.find(p => p.id === profile.comparisonControlId);
+  const baseline = stateFor(MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE, { observations: 3, dailyReturn: 0.1 });
+  const candidate = stateFor(profile, { observations: 3, dailyReturn: 0.001 });
+  const control = stateFor(controlProfile, { observations: 3, dailyReturn: 0.001 });
+  candidate.reports[1].settledLocks = { trend: 'loss' };
+  candidate.reports[2].settledProfitDeRisk = { marketNeutral: { scale: 0.1 } };
+  const review = buildPaperStrategyReview({ baselineState: baseline, shadowStates: [candidate, control] });
+  const result = review.candidates.find(p => p.id === profile.id);
+  assert.equal(result.metrics.pairedExcessReturn, 0);
+  assert.equal(result.comparison.benchmarkId, controlProfile.id);
+  assert.equal(result.comparison.synchronizedControl, true);
+  assert.deepEqual(result.comparison.riskStateMismatchDates, ['2024-01-02', '2024-01-03']);
+  assert.equal(result.comparison.riskStateMismatchDays, 2);
+  assert.equal(review.candidates.some(p => p.id === controlProfile.id), false);
+  assert.equal(review.trialCount, PAPER_SHADOW_PROFILES.filter(p => p.role !== 'control').length);
+});
+
+test('同期对照缺失或启动日不同不回退到旧主盘做晋级判断', () => {
+  const profile = PAPER_SHADOW_PROFILES.find(p => p.comparisonControlId);
+  const controlProfile = PAPER_SHADOW_PROFILES.find(p => p.id === profile.comparisonControlId);
+  const baseline = stateFor(MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE, { observations: 3 });
+  const candidate = stateFor(profile, { observations: 3 });
+  const mismatchedControl = stateFor(controlProfile, { startCycleDate: '2024-01-02', observations: 2 });
+  for (const shadowStates of [[candidate], [candidate, mismatchedControl]]) {
+    const result = buildPaperStrategyReview({ baselineState: baseline, shadowStates })
+      .candidates.find(p => p.id === profile.id);
+    assert.equal(result.metrics, undefined);
+    assert.match(result.statusReason, /同期对照账本缺失或启动日不一致/);
+  }
+});
+
 test('影子候选启动后保持独立ID，并在小样本阶段只采样不晋级', () => {
   const baseline = stateFor(MONTHLY_ACCURACY_PAPER_PROFILE, {
     observations: 2,

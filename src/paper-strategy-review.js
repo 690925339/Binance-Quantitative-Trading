@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { DIVERSIFIED_CAPPED_PROFILE, DIVERSIFIED_SPREAD_RISK_PROFILE, DIVERSIFIED_SPREAD_CONTROL_PROFILE } from './paper-optimization-profiles.js';
 import {
   addUtcDays,
   MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE,
@@ -184,6 +185,9 @@ export const PAPER_SHADOW_PROFILES = Object.freeze([
     },
     cashWeight: 0,
   }),
+  DIVERSIFIED_CAPPED_PROFILE,
+  DIVERSIFIED_SPREAD_CONTROL_PROFILE,
+  DIVERSIFIED_SPREAD_RISK_PROFILE,
 ]);
 
 export const PAPER_REVIEW_POLICY = Object.freeze({
@@ -629,7 +633,7 @@ function newsEvidence(state, acceptedDates) {
   };
 }
 
-function matchedCandidate(baselineState, candidateState, profile, trialCount) {
+function matchedCandidate(baselineState, candidateState, profile, trialCount, controlState = null) {
   const baselineProfileId = profile.baselineProfileId || MONTHLY_ACCURACY_PAPER_PROFILE.id;
   const effectiveProfile = candidateState?.profileSnapshot || profile;
   const profileSummary = {
@@ -691,8 +695,17 @@ function matchedCandidate(baselineState, candidateState, profile, trialCount) {
       statusReason: '影子账本尚未建立。',
     };
   }
+  if (profile.comparisonControlId && (!controlState
+    || controlState.startCycleDate !== candidateState.startCycleDate)) {
+    return {
+      id: effectiveProfile.id, name: effectiveProfile.name, role: effectiveProfile.role,
+      profile: profileSummary, status: 'not_started',
+      statusReason: '同期对照账本缺失或启动日不一致，暂不进行晋级比较。',
+    };
+  }
+  const benchmarkState = controlState || baselineState;
   const candidateByDate = new Map(dailyReports(candidateState).map((report) => [report.cycleDate, report]));
-  const baselineByDate = new Map(currentProfileEpoch(baselineState).reports
+  const baselineByDate = new Map(currentProfileEpoch(benchmarkState).reports
     .map((report) => [report.cycleDate, report]));
   const firstPairedDate = addUtcDays(candidateState.startCycleDate, 1);
   const dates = [...candidateByDate.keys()]
@@ -703,16 +716,18 @@ function matchedCandidate(baselineState, candidateState, profile, trialCount) {
   const benchmarkSeries = dates.map((date) => reportMetricPoint(baselineByDate.get(date)));
   const latestDate = dates.at(-1) || candidateState.lastCycleDate;
   const candidateMetrics = calculateMetrics(candidateSeries, {
-    entryReturn: initializationReturn(candidateState),
+    // Paired daily returns start after entry. Inception fees belong to the ledger,
+    // not to a comparison whose accounts were opened on different dates.
+    entryReturn: 0,
     firstFullMonth: candidateState.firstFullMonth,
     latestDate,
     exposure: exposureMetrics(candidateState, acceptedDates),
   });
   const benchmarkMetrics = calculateMetrics(benchmarkSeries, {
-    entryReturn: initializationReturn(baselineState),
+    entryReturn: 0,
     firstFullMonth: candidateState.firstFullMonth,
     latestDate,
-    exposure: exposureMetrics(baselineState, acceptedDates),
+    exposure: exposureMetrics(benchmarkState, acceptedDates),
   });
   const excessReturns = dates.map((date) => (
     Math.log1p(Number(candidateByDate.get(date).dayReturn))
@@ -721,6 +736,15 @@ function matchedCandidate(baselineState, candidateState, profile, trialCount) {
   const bootstrapP = blockBootstrapP(excessReturns, effectiveProfile.id);
   const adjustedBootstrapP = bootstrapP === null ? null : Math.min(1, bootstrapP * trialCount);
   const gate = candidateGate(candidateMetrics, benchmarkMetrics, adjustedBootstrapP);
+  const riskStateMismatchDates = dates.filter((date) => {
+    const candidate = candidateByDate.get(date);
+    const baseline = baselineByDate.get(date);
+    return ['marketNeutral', 'trend'].some((key) => (
+      (candidate.settledLocks?.[key] || null) !== (baseline.settledLocks?.[key] || null)
+      || (candidate.settledProfitDeRisk?.[key]?.scale ?? 1)
+        !== (baseline.settledProfitDeRisk?.[key]?.scale ?? 1)
+    ));
+  });
   return {
     id: effectiveProfile.id,
     name: effectiveProfile.name,
@@ -732,6 +756,19 @@ function matchedCandidate(baselineState, candidateState, profile, trialCount) {
     lastCycleDate: candidateState.lastCycleDate,
     status: gate.status,
     statusReason: gate.reason,
+    comparison: {
+      benchmarkId: benchmarkState.strategyProfileId,
+      benchmarkName: benchmarkState.strategyName,
+      synchronizedControl: Boolean(controlState),
+      startCycleDate: dates[0] || null,
+      endCycleDate: dates.at(-1) || null,
+      initializationFeesIncluded: false,
+      candidateInitializationCostReturn: initializationReturn(candidateState),
+      baselineInitializationCostReturn: initializationReturn(benchmarkState),
+      riskStateMismatchDays: riskStateMismatchDates.length,
+      riskStateMismatchDates,
+      note: '仅比较共同结算日净收益；建仓费保留在各自累计账本中。风控状态不同时，相对表现不能归因于单个参数。',
+    },
     metrics: {
       ...candidateMetrics,
       pairedExcessReturn: dates.length
@@ -1003,6 +1040,7 @@ export function buildPaperStrategyReview({
   shadowStates = [],
   now = Date.now(),
 }) {
+  const candidateProfiles = PAPER_SHADOW_PROFILES.filter(profile => profile.role !== 'control');
   if (!baselineState) {
     return {
       version: 1,
@@ -1016,7 +1054,7 @@ export function buildPaperStrategyReview({
         metrics: null,
       },
       candidates: [],
-      trialCount: PAPER_SHADOW_PROFILES.length,
+      trialCount: candidateProfiles.length,
       policy: PAPER_REVIEW_POLICY,
       promotionMode: 'MANUAL_REVIEW_ONLY',
       targetDisclaimer: '年化10%和80%盈利月是候选晋级目标，不是收益或胜率保证。',
@@ -1040,11 +1078,12 @@ export function buildPaperStrategyReview({
       exposure: exposureMetrics(baselineState, baselineDates),
     },
   );
-  const candidates = PAPER_SHADOW_PROFILES.map((profile) => matchedCandidate(
+  const candidates = candidateProfiles.map((profile) => matchedCandidate(
     baselineState,
     shadowById.get(profile.id),
     profile,
-    PAPER_SHADOW_PROFILES.length,
+    candidateProfiles.length,
+    profile.comparisonControlId ? shadowById.get(profile.comparisonControlId) : null,
   ));
   return {
     version: 1,
@@ -1069,7 +1108,7 @@ export function buildPaperStrategyReview({
       baselineReports,
     )),
     candidates,
-    trialCount: PAPER_SHADOW_PROFILES.length,
+    trialCount: candidateProfiles.length,
     policy: PAPER_REVIEW_POLICY,
     promotionMode: 'MANUAL_REVIEW_ONLY',
     targetDisclaimer: '年化10%和80%盈利月是候选晋级目标，不是收益或胜率保证。',
@@ -1160,6 +1199,11 @@ export async function writePaperReviewArtifacts(rootDir, review) {
     ...review.candidates.map((candidate) => (
       `| ${candidate.name} | ${candidate.status} | ${candidate.metrics?.observations || 0}天 | ${candidate.metrics?.fullMonthCount || 0} | ${percent(candidate.metrics?.pairedExcessReturn)} |`
     )),
+    '',
+    ...review.candidates.flatMap((candidate) => candidate.comparison ? [
+      `- ${candidate.name}对照：${candidate.comparison.benchmarkName}；共同结算日 ${candidate.comparison.startCycleDate || '--'} 至 ${candidate.comparison.endCycleDate || '--'}${candidate.comparison.synchronizedControl ? '（同日启动对照）' : ''}。`,
+      `  - 比较不计初始化建仓费，费用仍保留在各自累计账本；风控状态不同 ${candidate.comparison.riskStateMismatchDays} 天，不能将差异全部归因于单个参数。`,
+    ] : []),
     '',
     ...review.candidates.flatMap((candidate) => candidate.newsEvidence ? [
       `- ${candidate.name}新闻触发：${candidate.newsEvidence.activeDays}/${candidate.newsEvidence.evaluatedDays} 天（${percent(candidate.newsEvidence.activationRatio)}），平均实际权重 ${Number(candidate.newsEvidence.averageAppliedNewsWeightPercent || 0).toFixed(2)}%。`,

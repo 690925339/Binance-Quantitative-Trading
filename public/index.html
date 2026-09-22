@@ -190,8 +190,8 @@
           <div class="page-heading paper-heading">
             <div>
               <p class="eyebrow">DAILY PAPER PORTFOLIO</p>
-              <h1>策略模拟盘</h1>
-              <p>85%横截面多空＋15%趋势；不做盈利空仓，达到月内收益阈值后保留10%敞口持续交易，每天北京时间09:00结算。</p>
+              <h1>BTC 单币模拟盘</h1>
+              <p>仅 BTCUSDT 参与持仓、净值与盈亏计算；组合盘及相关影子盘已停用，历史记录保留。每天北京时间09:00结算。</p>
             </div>
             <span class="paper-status-badge" id="paperStatus">读取中</span>
           </div>
@@ -212,7 +212,7 @@
           </section>
 
           <div class="section-title strategy-section-title btc-paper-title">
-            <div><p class="eyebrow">BTC ONLY PAPER</p><h2>BTC单币模拟盘</h2></div>
+            <div><p class="eyebrow">BTC SIGNAL &amp; RISK</p><h2>信号与风险状态</h2></div>
             <span class="paper-status-badge" id="btcPaperStatus">读取中</span>
           </div>
           <section class="card btc-paper-card" id="btcPaperCard">
@@ -220,7 +220,7 @@
               <div><strong>BTC动态多空</strong><small id="btcPaperUpdatedAt">等待建立模拟仓</small></div>
               <b id="btcPaperSignal">--</b>
             </header>
-            <div class="btc-paper-equity">
+            <div class="btc-paper-equity" hidden>
               <strong id="btcPaperEquity">--</strong>
               <span class="neutral" id="btcPaperPnl">累计 --</span>
             </div>
@@ -238,15 +238,15 @@
           </section>
 
           <div class="section-title strategy-section-title">
-            <div><p class="eyebrow">REVIEW &amp; CHALLENGERS</p><h2>归因复盘与影子优化</h2></div>
+            <div><p class="eyebrow">BTC REVIEW</p><h2>BTC归因与优化复盘</h2></div>
           </div>
           <section class="card paper-review-card">
             <header>
-              <div><strong>当前版本参数已固定</strong><span>组合盘与BTC单币盘独立记账；候选不会自动替换或加杠杆</span></div>
+              <div><strong>仅复盘 BTC，不合并其他账本</strong><span>保留原本金与历史盈亏；优化需通过成本和回撤验证，不自动加杠杆</span></div>
               <b id="paperReviewCycle">--</b>
             </header>
             <div class="paper-attribution" id="paperAttribution">
-              <div class="empty-state"><span>△</span><strong>等待首个完整日报</strong><p>结算后会拆分币种、子策略与成本贡献</p></div>
+              <div class="empty-state"><span>△</span><strong>等待首个完整日报</strong><p>结算后拆分BTC价格贡献、成本和新闻决策</p></div>
             </div>
             <div class="paper-candidate-list" id="paperCandidateList"></div>
           </section>

@@ -5,9 +5,54 @@ import {
   btcPaperSnapshot,
   BTC_SINGLE_ASSET_PAPER_PROFILE,
   evaluateBtcNewsRisk,
+  evaluateBtcProfitDeRisk,
+  evaluateBtcNewsDataGuard,
+  evaluateBtcRebalance,
+  queueBtcNewsDataGuard,
   initializeBtcPaperState,
 } from '../src/btc-paper.js';
+import { BTC_GRADUAL_RISK_PROFILE } from '../src/paper-optimization-profiles.js';
 import { addUtcDays } from '../src/monthly-accuracy-paper.js';
+
+test('新闻缺失保护不加仓不开仓，减仓和平仓不受阻；新鲜但中性新闻不触发', () => {
+  for (const [old, target, expected] of [[0, 0.5, 0], [0.2, 0.5, 0.2], [0.5, 0.2, 0.2],
+    [-0.2, -0.5, -0.2], [-0.5, -0.2, -0.2], [0.2, -0.3, 0], [-0.2, 0.3, 0], [0.5, 0, 0]]) {
+    const result = evaluateBtcNewsDataGuard(old, target, { signalFresh: false }, true);
+    assert.equal(result.targetWeight, expected);
+    assert.equal(result.active, true);
+  }
+  assert.equal(evaluateBtcNewsDataGuard(0.1, 0.5, { signalFresh: true, eligible: false }, true).targetWeight, 0.5);
+  assert.equal(evaluateBtcNewsDataGuard(0.1, 0.5, null, false).targetWeight, 0.5);
+});
+
+test('研究用加仓过滤不延迟风险减仓、平仓、反向；默认关闭', () => {
+  assert.equal(evaluateBtcRebalance(0.2, 0.21, 0.02).executedWeight, 0.2);
+  assert.equal(evaluateBtcRebalance(-0.2, -0.21, 0.02).executedWeight, -0.2);
+  for (const target of [0.19, 0, -0.2, 0.25]) assert.equal(evaluateBtcRebalance(0.2, target, 0.02).executedWeight, target);
+  assert.equal(evaluateBtcRebalance(0.2, 0.21).executedWeight, 0.21);
+  assert.throws(() => evaluateBtcRebalance(0, 0.2, -1));
+});
+
+test('新闻保护升级仅在下个未来决策生效，补跑不回写既有策略历史', () => {
+  const series = btcSeries('2025-11-01', '2026-09-23');
+  const state = initializeBtcPaperState({ seriesBySymbol: series, cycleDate: '2026-09-20', markPrice: 45000 });
+  const historical = JSON.stringify(state.reports);
+  const equity = state.equity;
+  queueBtcNewsDataGuard(state, Date.parse('2026-09-22T02:00:00Z'));
+  assert.equal(state.pendingStrategyChange.effectiveFromCycleDate, '2026-09-23');
+  assert.equal(state.equity, equity);
+  assert.equal(JSON.stringify(state.reports), historical);
+  const marks = { '2026-09-21': { BTCUSDT: 45000 }, '2026-09-22': { BTCUSDT: 45000 }, '2026-09-23': { BTCUSDT: 45000 } };
+  advanceBtcPaperState({ state, seriesBySymbol: series, markPricesByCycleDate: marks, throughCycleDate: '2026-09-22' });
+  assert.equal(state.strategyProfileId, BTC_SINGLE_ASSET_PAPER_PROFILE.id);
+  const priorReports = JSON.stringify(state.reports);
+  advanceBtcPaperState({ state, seriesBySymbol: series, markPricesByCycleDate: marks, throughCycleDate: '2026-09-23' });
+  assert.equal(state.profileSnapshot.newsDataQualityGuardEnabled, true);
+  assert.equal(state.latestReport.dataQualityRisk.active, true);
+  assert.equal(state.latestReport.settledStrategyProfileId, BTC_SINGLE_ASSET_PAPER_PROFILE.id);
+  assert.equal(JSON.stringify(state.reports.slice(0, -1)), priorReports);
+  assert.equal(state.strategyChanges.length, 1);
+});
 
 function btcSeries(startDate, endDate, dailyReturn = 0.002) {
   const rows = [];
@@ -20,6 +65,23 @@ function btcSeries(startDate, endDate, dailyReturn = 0.002) {
   }
   return { BTCUSDT: rows };
 }
+
+test('渐进减仓在1%至3%收益间连续变化，旧策略仍保持原规则', () => {
+  const state = (returnRate) => ({ equity: 10000 * (1 + returnRate), monthStartEquity: 10000 });
+  for (const [ret, expected] of [[-0.02, 1], [0.01, 1], [0.02, 0.75], [0.03, 0.5], [0.1, 0.5]]) {
+    assert.ok(Math.abs(evaluateBtcProfitDeRisk(state(ret), BTC_GRADUAL_RISK_PROFILE).scale - expected) < 1e-10);
+  }
+  assert.equal(evaluateBtcProfitDeRisk(state(0.02)).scale, 0.1);
+  assert.throws(() => evaluateBtcProfitDeRisk(state(0.02), {
+    ...BTC_GRADUAL_RISK_PROFILE, monthlyProfitDeRiskFullAt: 0.005,
+  }), /参数无效/);
+});
+
+test('新闻诊断完整列出未通过项，不把缺少证据的消息当作入场依据', () => {
+  const risk = evaluateBtcNewsRisk(null, 0.5, '2026-09-05');
+  assert.deepEqual(risk.failedChecks, ['fresh', 'directionStrength', 'credibility', 'confidence', 'articles', 'directionalEvidence']);
+  assert.equal(risk.appliedGrossExposureScale, 1);
+});
 
 test('BTC单币策略只建立BTC仓位并沿用多周期动态趋势参数', () => {
   const profile = BTC_SINGLE_ASSET_PAPER_PROFILE;

@@ -6,20 +6,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$runner = Join-Path $PSScriptRoot 'paper-trade-daily.mjs'
+$runner = Join-Path $PSScriptRoot 'run-paper-task.ps1'
 if (-not (Test-Path -LiteralPath $runner)) {
-  throw "找不到模拟盘执行脚本：$runner"
+  throw "Paper task runner not found: $runner"
 }
 if ([string]::IsNullOrWhiteSpace($NodePath)) {
   $NodePath = (Get-Command node -ErrorAction Stop).Source
 }
 if (-not (Test-Path -LiteralPath $NodePath)) {
-  throw "找不到 Node.js：$NodePath"
+  throw "Node.js not found: $NodePath"
 }
 
 $action = New-ScheduledTaskAction `
-  -Execute $NodePath `
-  -Argument "`"$runner`" --notify" `
+  -Execute (Join-Path $PSHOME 'powershell.exe') `
+  -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runner`" -NodePath `"$NodePath`"" `
   -WorkingDirectory $repo
 $trigger = New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.AddHours(9))
 $settings = New-ScheduledTaskSettingsSet `
@@ -43,9 +43,30 @@ Register-ScheduledTask `
   -Trigger $trigger `
   -Settings $settings `
   -Principal $principal `
-  -Description 'QuantFlow模拟盘每日北京时间09:00结算盈亏并显示Windows通知' `
+  -Description 'QuantFlow paper settlement at 09:00 Beijing time with Windows notification' `
   -Force | Out-Null
 
-Get-ScheduledTask -TaskName $TaskName
-Get-ScheduledTaskInfo -TaskName $TaskName |
-  Select-Object LastRunTime, LastTaskResult, NextRunTime, NumberOfMissedRuns
+# Check for missed settlements once daily at 10:00. The recovery task does not
+# wake the computer or add login/minute-level triggers.
+$recoveryTaskName = "${TaskName}CatchUp"
+$recoveryTrigger = New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.AddHours(10))
+$recoverySettings = New-ScheduledTaskSettingsSet `
+  -StartWhenAvailable `
+  -AllowStartIfOnBatteries `
+  -DontStopIfGoingOnBatteries `
+  -ExecutionTimeLimit (New-TimeSpan -Minutes 15) `
+  -MultipleInstances IgnoreNew
+Register-ScheduledTask `
+  -TaskName $recoveryTaskName `
+  -Action $action `
+  -Trigger $recoveryTrigger `
+  -Settings $recoverySettings `
+  -Principal $principal `
+  -Description 'QuantFlow paper recovery: once daily at 10:00; skips settled cycles and records failures' `
+  -Force | Out-Null
+
+Get-ScheduledTask -TaskName $TaskName, $recoveryTaskName
+foreach ($registeredName in @($TaskName, $recoveryTaskName)) {
+  Get-ScheduledTaskInfo -TaskName $registeredName |
+    Select-Object TaskName, LastRunTime, LastTaskResult, NextRunTime, NumberOfMissedRuns
+}

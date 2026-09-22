@@ -5,7 +5,7 @@ import {
   calculateLongShortTrendWeights,
   calculateTrendSignal,
 } from './long-short-trend.js';
-import { addUtcDays } from './monthly-accuracy-paper.js';
+import { addUtcDays, latestCompletePaperCycleDate } from './monthly-accuracy-paper.js';
 
 const MAX_REPORTS = 4_000;
 const BTC_SYMBOL = 'BTCUSDT';
@@ -45,6 +45,31 @@ export const BTC_SINGLE_ASSET_PAPER_PROFILE = Object.freeze({
     dailyCarryCostRate: 0.00005,
   }),
 });
+
+export const BTC_NEWS_DATA_GUARD_PROFILE = Object.freeze({
+  ...BTC_SINGLE_ASSET_PAPER_PROFILE,
+  id: 'btc-single-asset-trend-news-v2-data-guard',
+  name: 'BTC单币动态多空｜新闻数据保护',
+  newsDataQualityGuardEnabled: true,
+});
+
+export function queueBtcNewsDataGuard(state, now = Date.now()) {
+  if (!state || state.profileSnapshot?.newsDataQualityGuardEnabled || state.pendingStrategyChange) return state;
+  state.pendingStrategyChange = { fromProfileId: state.strategyProfileId,
+    toProfileId: BTC_NEWS_DATA_GUARD_PROFILE.id, queuedAt: new Date(now).toISOString(),
+    effectiveFromCycleDate: addUtcDays([state.lastCycleDate, latestCompletePaperCycleDate(now)].sort().at(-1), 1),
+    reason: '新闻缺失或过期时禁止增加风险，保留减仓与退出；不更改杠杆、趋势或盈利降风险参数。' };
+  return state;
+}
+
+export function evaluateBtcNewsDataGuard(previousWeight, proposedWeight, newsRisk, enabled = false) {
+  const active = enabled && !newsRisk?.signalFresh;
+  const targetWeight = active
+    ? (previousWeight * proposedWeight > 0 ? Math.sign(proposedWeight) * Math.min(Math.abs(previousWeight), Math.abs(proposedWeight)) : 0)
+    : proposedWeight;
+  return { enabled, active, blockedIncrease: active && targetWeight !== proposedWeight,
+    proposedWeight, targetWeight, reason: active ? 'news_missing_or_stale_no_new_risk' : null };
+}
 
 function round(value, digits = 8) {
   return Number(Number(value).toFixed(digits));
@@ -128,6 +153,14 @@ export function evaluateBtcNewsRisk(newsSnapshot, proposedWeight, cycleDate, pro
     && evidencePassed;
   const conflict = eligible && ((proposedWeight > 0 && score < 0)
     || (proposedWeight < 0 && score > 0));
+  const checks = {
+    fresh: signalFresh,
+    directionStrength: Math.abs(score) >= profile.newsRiskMinimumAbsoluteScore,
+    credibility: credibility >= profile.newsRiskMinimumCredibility,
+    confidence: confidence >= profile.newsRiskMinimumConfidence,
+    articles: articleCount >= 1,
+    directionalEvidence: evidencePassed,
+  };
   return {
     status: newsSnapshot?.status || 'missing',
     signalFresh,
@@ -141,6 +174,8 @@ export function evaluateBtcNewsRisk(newsSnapshot, proposedWeight, cycleDate, pro
     evidencePassed,
     eligible,
     conflict,
+    checks,
+    failedChecks: Object.keys(checks).filter((key) => !checks[key]),
     appliedGrossExposureScale: conflict ? profile.newsRiskGrossExposureScale : 1,
     fallbackReason: eligible
       ? null
@@ -185,15 +220,31 @@ function signalAllocation(seriesBySymbol, signalDate, profile) {
   };
 }
 
-function profitDeRisk(state, profile) {
+export function evaluateBtcProfitDeRisk(state, profile = BTC_SINGLE_ASSET_PAPER_PROFILE) {
   const monthlyReturn = state.equity / state.monthStartEquity - 1;
   const active = monthlyReturn >= profile.monthlyProfitDeRiskThreshold;
+  const mode = profile.monthlyProfitDeRiskMode || 'step';
+  let scale = active ? profile.monthlyProfitDeRiskScale : 1;
+  if (mode === 'linear') {
+    const fullAt = profile.monthlyProfitDeRiskFullAt;
+    if (!Number.isFinite(fullAt) || fullAt <= profile.monthlyProfitDeRiskThreshold
+      || !(profile.monthlyProfitDeRiskScale > 0 && profile.monthlyProfitDeRiskScale <= 1)) {
+      throw new Error('BTC渐进减仓参数无效');
+    }
+    const progress = Math.max(0, Math.min(1,
+      (monthlyReturn - profile.monthlyProfitDeRiskThreshold)
+        / (fullAt - profile.monthlyProfitDeRiskThreshold)));
+    scale = 1 - progress * (1 - profile.monthlyProfitDeRiskScale);
+  } else if (mode !== 'step') {
+    throw new Error('未知BTC减仓模式');
+  }
   return {
     enabled: true,
     active,
+    mode,
     threshold: profile.monthlyProfitDeRiskThreshold,
     configuredScale: profile.monthlyProfitDeRiskScale,
-    scale: active ? profile.monthlyProfitDeRiskScale : 1,
+    scale,
     monthlyReturn: round(monthlyReturn),
   };
 }
@@ -227,19 +278,36 @@ function signalSnapshot(allocation) {
   };
 }
 
+export function evaluateBtcRebalance(previousWeight, proposedWeight, minimumIncrease = 0) {
+  if (!Number.isFinite(minimumIncrease) || minimumIncrease < 0 || minimumIncrease > 0.1) {
+    throw new Error('BTC最小加仓阈值必须在0至10%之间');
+  }
+  const sameDirection = previousWeight * proposedWeight > 0;
+  const increase = Math.abs(proposedWeight) - Math.abs(previousWeight);
+  const deferred = sameDirection && increase > 0 && increase < minimumIncrease;
+  // Never delay a reduction, full exit or directional reversal.
+  return { minimumIncrease, deferred, targetWeight: proposedWeight,
+    executedWeight: deferred ? previousWeight : proposedWeight };
+}
+
 function applyNextSignal({ state, seriesBySymbol, signalDate, cycleDate, newsSnapshot, profile }) {
   const allocation = signalAllocation(seriesBySymbol, signalDate, profile);
-  const deRisk = profitDeRisk(state, profile);
+  const deRisk = evaluateBtcProfitDeRisk(state, profile);
   let proposedWeight = state.lockReason === null
     ? allocation.rawWeight * deRisk.scale
     : 0;
   const newsRisk = evaluateBtcNewsRisk(newsSnapshot, proposedWeight, cycleDate, profile);
   proposedWeight *= newsRisk.appliedGrossExposureScale;
+  const dataQualityRisk = evaluateBtcNewsDataGuard(state.weight, proposedWeight, newsRisk, profile.newsDataQualityGuardEnabled);
+  proposedWeight = dataQualityRisk.targetWeight;
+  const rebalance = evaluateBtcRebalance(state.weight, proposedWeight, profile.minimumWeightIncrease || 0);
   return {
     allocation,
     profitDeRisk: deRisk,
     newsRisk,
-    proposedWeight,
+    proposedWeight: rebalance.executedWeight,
+    rebalance,
+    dataQualityRisk,
   };
 }
 
@@ -315,6 +383,8 @@ export function initializeBtcPaperState({
   state.lastSignal = signalSnapshot(next.allocation);
   state.lastNewsRisk = next.newsRisk;
   state.lastProfitDeRisk = next.profitDeRisk;
+  state.lastRebalance = next.rebalance;
+  state.lastDataQualityRisk = next.dataQualityRisk;
   state.maxDrawdown = round(state.equity / state.peakEquity - 1);
   Object.assign(state, stateSnapshotFields(state, profile));
   const report = {
@@ -342,6 +412,8 @@ export function initializeBtcPaperState({
     signal: state.lastSignal,
     newsRisk: state.lastNewsRisk,
     profitDeRisk: state.lastProfitDeRisk,
+    rebalance: state.lastRebalance,
+    dataQualityRisk: state.lastDataQualityRisk,
     lockReason: state.lockReason,
     positions: state.positions,
     modelGrossExposure: state.modelGrossExposure,
@@ -369,6 +441,17 @@ export function advanceBtcPaperState({
   }
   let cycleDate = addUtcDays(state.lastCycleDate, 1);
   while (cycleDate <= throughCycleDate) {
+    const settledStrategyProfileId = state.strategyProfileId;
+    if (state.pendingStrategyChange && cycleDate >= state.pendingStrategyChange.effectiveFromCycleDate) {
+      const change = state.pendingStrategyChange;
+      if (change.toProfileId !== BTC_NEWS_DATA_GUARD_PROFILE.id) throw new Error('未知BTC待生效策略');
+      profile = { ...profile, id: change.toProfileId, name: BTC_NEWS_DATA_GUARD_PROFILE.name, newsDataQualityGuardEnabled: true };
+      state.strategyProfileId = profile.id;
+      state.strategyName = profile.name;
+      state.profileSnapshot = profileSnapshot(profile);
+      state.strategyChanges = [...(state.strategyChanges || []), { ...change, appliedAt: new Date(now).toISOString() }];
+      state.pendingStrategyChange = null;
+    }
     const signalDate = addUtcDays(cycleDate, -1);
     const currentPrice = validatePrice(
       markPricesByCycleDate?.[cycleDate]?.[profile.symbol]
@@ -413,6 +496,8 @@ export function advanceBtcPaperState({
     state.lastSignal = signalSnapshot(next.allocation);
     state.lastNewsRisk = next.newsRisk;
     state.lastProfitDeRisk = next.profitDeRisk;
+    state.lastRebalance = next.rebalance;
+    state.lastDataQualityRisk = next.dataQualityRisk;
     state.peakEquity = round(Math.max(state.peakEquity, state.equity), 4);
     state.maxDrawdown = round(Math.min(state.maxDrawdown, state.equity / state.peakEquity - 1));
     state.lastCycleDate = cycleDate;
@@ -423,6 +508,7 @@ export function advanceBtcPaperState({
       id: `btc-paper-${cycleDate}`,
       kind: 'daily',
       strategyProfileId: state.strategyProfileId,
+      settledStrategyProfileId,
       cycleDate,
       signalDate,
       periodStart: state.latestReport?.periodEnd || null,
@@ -443,6 +529,8 @@ export function advanceBtcPaperState({
       signal: state.lastSignal,
       newsRisk: state.lastNewsRisk,
       profitDeRisk: state.lastProfitDeRisk,
+      rebalance: state.lastRebalance,
+      dataQualityRisk: state.lastDataQualityRisk,
       settledLockReason,
       lockReason: state.lockReason,
       monthChanged,
@@ -515,6 +603,10 @@ export function btcPaperSnapshot(state) {
     signal: state.lastSignal,
     newsRisk: state.lastNewsRisk,
     profitDeRisk: state.lastProfitDeRisk,
+    rebalance: state.lastRebalance || null,
+    dataQualityRisk: state.lastDataQualityRisk || null,
+    pendingStrategyChange: state.pendingStrategyChange || null,
+    strategyChanges: state.strategyChanges || [],
     accuracy: {
       observations: dailyReports.length,
       profitableDays,

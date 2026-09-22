@@ -119,13 +119,14 @@ test('新状态的周期和时间可从最新日报推导', () => {
   assert.equal(freshness.reportCount, 2);
 });
 
-test('云端组合盘响应会合并BTC账本和影子复盘', () => {
+test('云端主响应仅使用BTC账本，旧组合盘及影子复盘不参与计算', () => {
   const paper = { status: 'running', totalPnl: 172.54 };
   const btc = { status: 'running', totalPnl: 327.15 };
   const review = { status: 'running', candidates: [{ id: 'shadow-v3' }] };
-  assert.deepEqual(combinePaperPortfolioState(paper, btc, review), {
-    ...paper,
-    btcPortfolio: btc,
-    optimizationReview: review,
-  });
+  const actual = combinePaperPortfolioState(paper, btc, review);
+  assert.equal(actual.totalPnl, btc.totalPnl);
+  assert.equal(actual.btcPortfolio, btc);
+  assert.equal(actual.scope, 'btc_only');
+  assert.deepEqual(actual.optimizationReview.candidates, []);
+  assert.equal(combinePaperPortfolioState(paper, null, review).status, 'not_started');
 });

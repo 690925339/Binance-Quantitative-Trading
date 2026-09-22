@@ -497,7 +497,11 @@ async function fetchText(url, fetchImpl) {
     },
     signal: AbortSignal.timeout(8_000),
   });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  if (!response.ok) {
+    const error = new Error(`HTTP ${response.status}`);
+    error.retryable = response.status === 408 || response.status >= 500;
+    throw error;
+  }
   const contentLength = Number(response.headers.get('content-length') || 0);
   if (contentLength > 2_000_000) throw new Error('新闻响应内容过大');
   const text = await response.text();
@@ -530,6 +534,8 @@ export class NewsService {
     fetchImpl = fetch,
     now = () => Date.now(),
     cacheTtlMs = 60_000,
+    feedRetryCount = 1,
+    retryDelayMs = 250,
   } = {}) {
     this.feeds = feeds;
     this.cryptoPanicToken = cryptoPanicToken;
@@ -537,6 +543,8 @@ export class NewsService {
     this.fetchImpl = fetchImpl;
     this.now = now;
     this.cacheTtlMs = cacheTtlMs;
+    this.feedRetryCount = feedRetryCount === 0 ? 0 : 1;
+    this.retryDelayMs = Math.min(1000, Math.max(0, Number(retryDelayMs) || 0));
     this.cache = null;
     this.refreshPromise = null;
   }
@@ -552,12 +560,24 @@ export class NewsService {
   }
 
   async #refresh(nowMs) {
-    const requests = this.feeds.map(async (source) => ({
-      source: source.name,
-      sourceTier: source.sourceTier || 'media',
-      sourceCategory: source.sourceCategory || 'media',
-      items: parseNewsFeed(await fetchText(source.url, this.fetchImpl), source),
-    }));
+    const requests = this.feeds.map(async (source) => {
+      for (let attempt = 1; ; attempt += 1) {
+        try {
+          return {
+            source: source.name,
+            sourceTier: source.sourceTier || 'media',
+            sourceCategory: source.sourceCategory || 'media',
+            attempts: attempt,
+            items: parseNewsFeed(await fetchText(source.url, this.fetchImpl), source),
+          };
+        } catch (error) {
+          error.attempts = attempt;
+          const transient = error.retryable || ['TimeoutError', 'AbortError', 'TypeError'].includes(error.name);
+          if (!transient || attempt > this.feedRetryCount) throw error;
+          await new Promise(resolve => setTimeout(resolve, this.retryDelayMs));
+        }
+      }
+    });
     if (this.cryptoPanicToken) {
       const url = new URL(`https://cryptopanic.com/api/${this.cryptoPanicPlan}/v2/posts/`);
       url.searchParams.set('auth_token', this.cryptoPanicToken);
@@ -574,6 +594,7 @@ export class NewsService {
       sourceTier: result.status === 'fulfilled' ? result.value.sourceTier : (this.feeds[index]?.sourceTier || 'media'),
       sourceCategory: result.status === 'fulfilled' ? result.value.sourceCategory : (this.feeds[index]?.sourceCategory || 'aggregator'),
       ok: result.status === 'fulfilled',
+      attempts: result.status === 'fulfilled' ? (result.value.attempts || 1) : (result.reason.attempts || 1),
       count: result.status === 'fulfilled' ? result.value.items.length : 0,
       error: result.status === 'rejected' ? result.reason.message : null,
     }));

@@ -122,8 +122,11 @@ test('模拟盘接口无需测试网会话且日报数量参数受限', async ()
   const payload = await response.json();
   assert.equal(response.status, 200);
   assert.equal(payload.mode, 'PAPER');
-  assert.equal(payload.strategyType, 'monthlyAccuracyPortfolio');
-  assert.equal(payload.optimizationReview.baseline.frozen, true);
+  assert.equal(payload.strategyType, 'btcSingleAssetTrend');
+  assert.equal(payload.scope, 'btc_only');
+  assert.equal(payload.equity, payload.btcPortfolio.equity);
+  assert.equal(payload.initialCapital, payload.btcPortfolio.initialCapital);
+  assert.deepEqual(payload.optimizationReview.candidates, []);
   assert.equal(payload.btcPortfolio.strategyType, 'btcSingleAssetTrend');
 
   const btc = await authFetch('/api/paper-portfolio/btc');
@@ -132,7 +135,10 @@ test('模拟盘接口无需测试网会话且日报数量参数受限', async ()
 
   const review = await authFetch('/api/paper-portfolio/review');
   assert.equal(review.status, 200);
-  assert.equal((await review.json()).promotionMode, 'MANUAL_REVIEW_ONLY');
+  assert.equal((await review.json()).scope, 'btc_only');
+
+  const reports = await authFetch('/api/paper-portfolio/reports?limit=7');
+  assert.deepEqual((await reports.json()).reports, payload.reports.slice(-7).reverse());
 
   const invalid = await authFetch('/api/paper-portfolio/reports?limit=0');
   assert.equal(invalid.status, 400);

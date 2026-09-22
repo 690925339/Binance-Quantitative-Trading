@@ -8,6 +8,7 @@ import {
 } from './cross-sectional-backtest.js';
 import { evaluateNewsGate } from './composite-strategies.js';
 import { calculateLongShortTrendWeights } from './long-short-trend.js';
+import { evaluateRollingDrawdownRisk } from './rolling-drawdown-risk.js';
 
 const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
@@ -610,10 +611,13 @@ function prepareMarketNeutral({
     ? { ...proposedBaseWeights }
     : zeroWeights(market.symbols);
   const profitDeRisk = monthlyProfitDeRisk(component, settings);
-  if (component.lockReason === null && profitDeRisk.active) {
+  const drawdownRisk = evaluateRollingDrawdownRisk(component, settings, addUtcDays(upcomingResultDate, -1));
+  const effectiveRiskScale = Math.min(profitDeRisk.scale, drawdownRisk.scale);
+  const drawdownRiskChanged = Math.abs((component.lastDrawdownRisk?.scale ?? 1) - drawdownRisk.scale) > 1e-12;
+  if (component.lockReason === null && effectiveRiskScale < 1) {
     proposedWeights = Object.fromEntries(Object.entries(proposedWeights).map(([symbol, weight]) => [
       symbol,
-      weight * profitDeRisk.scale,
+      weight * effectiveRiskScale,
     ]));
   }
   const previousProfitDeRiskActive = component.lastProfitDeRisk?.active === true;
@@ -626,7 +630,7 @@ function prepareMarketNeutral({
     force,
     monthChanged,
     needsLockClose,
-    referenceScaleChanged: newsDecisionChanged || profitDeRiskChanged,
+    referenceScaleChanged: newsDecisionChanged || profitDeRiskChanged || drawdownRiskChanged,
     proposedTurnover,
     minimumRebalanceTurnover: settings.minimumRebalanceTurnover || 0,
   });
@@ -635,6 +639,7 @@ function prepareMarketNeutral({
     || monthChanged
     || newsDecisionChanged
     || profitDeRiskChanged
+    || drawdownRiskChanged
     || (scheduled && !suppressed)
     || turnover(component.weights, nextWeights, market.symbols) > 0;
   const nextTurnover = changed ? turnover(component.weights, nextWeights, market.symbols) : 0;
@@ -662,6 +667,7 @@ function prepareMarketNeutral({
   }
   component.weights = nextWeights;
   component.lastProfitDeRisk = profitDeRisk;
+  if (drawdownRisk.enabled) component.lastDrawdownRisk = drawdownRisk;
   if (news.decision) {
     const previousNewsDecision = component.lastNewsDecision || null;
     const riskVetoTriggered = component.lockReason === null && (allocation
@@ -707,6 +713,7 @@ function prepareMarketNeutral({
     newsDecision: component.lastNewsDecision || null,
     adaptiveRisk: component.lastAdaptiveRisk || null,
     profitDeRisk,
+    drawdownRisk,
   };
 }
 
@@ -832,6 +839,7 @@ function reportSummary(state, report) {
         dynamicLeverage: state.components.marketNeutral.dynamicLeverage,
         newsOverlay: state.components.marketNeutral.lastNewsDecision || null,
         adaptiveRisk: state.components.marketNeutral.lastAdaptiveRisk || null,
+        drawdownRisk: state.components.marketNeutral.lastDrawdownRisk || null,
         profitDeRisk: state.components.marketNeutral.lastProfitDeRisk || null,
       },
       trend: {
@@ -991,9 +999,11 @@ export function initializePaperState({
     symbolAttribution: [],
     settledNewsOverlay: null,
     settledAdaptiveRisk: null,
+    settledDrawdownRisk: null,
     settledProfitDeRisk: null,
     nextNewsOverlay: marketNeutralTrade.newsDecision,
     nextAdaptiveRisk: marketNeutralTrade.adaptiveRisk,
+    nextDrawdownRisk: marketNeutralTrade.drawdownRisk,
     nextProfitDeRisk: {
       marketNeutral: marketNeutralTrade.profitDeRisk,
       trend: trendTrade.profitDeRisk,
@@ -1137,6 +1147,7 @@ export function advancePaperState({
     };
     const settledNewsOverlay = state.components.marketNeutral.lastNewsDecision || null;
     const settledAdaptiveRisk = state.components.marketNeutral.lastAdaptiveRisk || null;
+    const settledDrawdownRisk = state.components.marketNeutral.lastDrawdownRisk || null;
     const settledProfitDeRisk = {
       marketNeutral: state.components.marketNeutral.lastProfitDeRisk || null,
       trend: state.components.trend.lastProfitDeRisk || null,
@@ -1236,9 +1247,11 @@ export function advancePaperState({
       settledLocks,
       settledNewsOverlay,
       settledAdaptiveRisk,
+      settledDrawdownRisk,
       settledProfitDeRisk,
       nextNewsOverlay: marketNeutralTrade.newsDecision,
       nextAdaptiveRisk: marketNeutralTrade.adaptiveRisk,
+      nextDrawdownRisk: marketNeutralTrade.drawdownRisk,
       nextProfitDeRisk: {
         marketNeutral: marketNeutralTrade.profitDeRisk,
         trend: trendTrade.profitDeRisk,
@@ -1501,6 +1514,7 @@ export function paperPortfolioSnapshot(state) {
         dynamicLeverage: state.components.marketNeutral.dynamicLeverage,
         newsOverlay: state.components.marketNeutral.lastNewsDecision || null,
         adaptiveRisk: state.components.marketNeutral.lastAdaptiveRisk || null,
+        drawdownRisk: state.components.marketNeutral.lastDrawdownRisk || null,
         profitDeRisk: state.components.marketNeutral.lastProfitDeRisk || null,
       },
       trend: {

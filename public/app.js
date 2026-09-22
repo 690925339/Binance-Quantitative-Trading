@@ -432,13 +432,15 @@ function renderBtcPaperPortfolio(paper) {
   $('#btcPaperRisk').textContent = paper.lockReason === 'loss'
     ? '1.5%月度亏损保护已触发'
     : deRisk?.active
-      ? '月收益达1%，保留10%敞口'
+      ? `盈利降风险中，保留原目标的${Number(deRisk.scale * 100).toFixed(0)}%敞口`
       : `正常运行 · 月内 ${percentFormat(paper.monthlyReturn)}`;
-  $('#btcPaperNews').textContent = newsRisk?.conflict
+  $('#btcPaperNews').textContent = paper.dataQualityRisk?.active
+    ? '新闻缺失或过期：禁止新增风险，可减仓和平仓'
+    : newsRisk?.conflict
     ? `可信冲突，敞口降至${Number(newsRisk.appliedGrossExposureScale * 100).toFixed(0)}%`
     : newsRisk?.eligible
       ? `${newsRisk.direction === 'bullish' ? '利多' : '利空'}证据合格，无持仓冲突`
-      : '未形成合格的BTC专属事件证据';
+      : `未调整仓位 · ${newsRisk?.fallbackReason || '未形成合格的BTC专属事件证据'}`;
   $('#btcPaperAccuracy').textContent = paper.accuracy?.directionalObservations
     ? `${paper.accuracy.directionalHits}/${paper.accuracy.directionalObservations} · ${percentFormat(paper.accuracy.directionalHitRate)}`
     : '--';
@@ -469,7 +471,7 @@ function renderPaperPortfolio(paper) {
     $('#paperGross').textContent = '--';
     $('#paperNextReport').textContent = '--';
     $('#paperReviewCycle').textContent = '--';
-    $('#paperAttribution').innerHTML = '<div class="empty-state"><span>△</span><strong>等待首个完整日报</strong><p>结算后会拆分币种、子策略与成本贡献</p></div>';
+    $('#paperAttribution').innerHTML = '<div class="empty-state"><span>△</span><strong>等待首个完整日报</strong><p>结算后显示BTC价格、成本与新闻决策</p></div>';
     $('#paperCandidateList').innerHTML = '';
     $('#paperPositionList').innerHTML = '<div class="empty-state"><span>◎</span><strong>模拟盘尚未启动</strong><p>运行每日纸面盘任务后将在这里显示持仓和盈亏</p></div>';
     $('#paperReportList').innerHTML = '<div class="empty-state"><span>◇</span><strong>暂无日报</strong><p>首次启动只建立基线</p></div>';
@@ -494,56 +496,25 @@ function renderPaperPortfolio(paper) {
 
   const review = paper.optimizationReview;
   const attribution = review?.latestAttribution;
-  const accuracy = review?.accuracyComparison;
+  const recent = review?.recent;
   $('#paperReviewCycle').textContent = review?.cycleDate || '--';
   $('#paperAttribution').innerHTML = attribution ? `
     <div class="paper-attribution-summary">
-      <div><span>横截面子策略</span><b class="${pnlClass(attribution.marketNeutral?.totalPnl)}">${formatPnl(attribution.marketNeutral?.totalPnl)}</b></div>
-      <div><span>趋势子策略</span><b class="${pnlClass(attribution.trend?.totalPnl)}">${formatPnl(attribution.trend?.totalPnl)}</b></div>
-      <div><span>最大拖累</span><b class="negative">${escapeHtml(attribution.largestDetractor.symbol)} ${formatPnl(attribution.largestDetractor.totalPricePnl)}</b></div>
-      <div><span>最大贡献</span><b class="positive">${escapeHtml(attribution.largestContributor.symbol)} ${formatPnl(attribution.largestContributor.totalPricePnl)}</b></div>
-      <div><span>多空价差变化</span><b class="${pnlClass(attribution.marketNeutralSpreadMove)}">${percentFormat(attribution.marketNeutralSpreadMove)}</b></div>
-      <div><span>成本占绝对盈亏</span><b>${percentFormat(attribution.costShareOfAbsolutePnl)}</b></div>
-      <div><span>当前v3方向命中</span><b>${accuracy?.currentStrategy?.directionalObservations ? `${accuracy.currentStrategy.directionalHits}/${accuracy.currentStrategy.directionalObservations} · ${percentFormat(accuracy.currentStrategy.directionalHitRate)}` : '--'}</b></div>
-      <div><span>v3前方向命中</span><b>${accuracy?.previousStrategies?.directionalObservations ? `${accuracy.previousStrategies.directionalHits}/${accuracy.previousStrategies.directionalObservations} · ${percentFormat(accuracy.previousStrategies.directionalHitRate)}` : '--'}</b></div>
+      <div><span>BTC价格贡献</span><b class="${pnlClass(attribution.pricePnl)}">${formatPnl(attribution.pricePnl)}</b></div>
+      <div><span>本日交易及持仓成本</span><b>${Number(attribution.tradingCost + attribution.carryCost).toFixed(2)} USDT</b></div>
+      <div><span>本期持仓 / BTC涨跌</span><b>${percentFormat(attribution.previousWeight)} / ${percentFormat(attribution.assetReturn)}</b></div>
+      <div><span>近30日盈利天数</span><b>${recent?.profitableDays || 0}/${recent?.observations || 0}</b></div>
+      <div><span>方向未命中 / 成本致亏</span><b>${recent?.directionalMisses || 0} / ${recent?.costOnlyLosses || 0}天</b></div>
+      <div><span>合格新闻 / 冲突减仓</span><b>${recent?.newsEligibleDays || 0} / ${recent?.newsConflictDays || 0}天</b></div>
+      <div><span>新闻缺失或过期</span><b>${recent?.newsMissingDays || 0}天</b></div>
+      <div><span>盈利降风险决策</span><b>${recent?.deRiskDays || 0}天</b></div>
     </div>
-    <ul>${attribution.diagnostics.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
+    <ul>${(review.diagnostics || []).map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
   ` : '<div class="empty-state"><span>△</span><strong>等待首个完整日报</strong><p>首日只建仓，次日开始生成归因</p></div>';
-  $('#paperCandidateList').innerHTML = (review?.candidates || []).map((candidate) => {
-    const metrics = candidate.metrics;
-    const newsOverlay = candidate.profile?.newsOverlay;
-    const newsDecision = candidate.latestNewsDecision;
-    const newsNote = newsOverlay ? `
-      <p class="paper-candidate-news">新闻目标权重 ${escapeHtml(newsOverlay.newsSignalWeight)}% · ${newsDecision
-        ? newsDecision.fallbackToPriceOnly
-          ? `当前退回价格信号：${escapeHtml(newsDecision.fallbackReason)}`
-          : `当前应用于 ${escapeHtml(newsDecision.eligibleSymbols.map((item) => item.symbol).join('、'))}`
-        : '等待首个09:00新闻快照'}</p>
-    ` : '';
-    return `
-      <article class="paper-candidate-card ${escapeHtml(candidate.status)}">
-        <header><div><strong>${escapeHtml(candidate.name)}</strong><span>${escapeHtml(candidate.hypothesis)}</span></div><b>${escapeHtml(paperCandidateStatus(candidate.status))}</b></header>
-        <div class="paper-candidate-metrics">
-          <span>共同样本 <strong>${metrics?.observations || 0} / 90天</strong></span>
-          <span>完整月份 <strong>${metrics?.fullMonthCount || 0} / 3</strong></span>
-          <span>相对基准 <strong class="${pnlClass(metrics?.pairedExcessReturn)}">${metrics?.pairedExcessReturn !== null && metrics?.pairedExcessReturn !== undefined ? percentFormat(metrics.pairedExcessReturn) : '--'}</strong></span>
-          <span>最大回撤 <strong>${metrics ? percentFormat(metrics.maxDrawdown) : '--'}</strong></span>
-          <span>方向命中 <strong>${metrics?.directionalObservations ? `${metrics.directionalHits}/${metrics.directionalObservations} · ${percentFormat(metrics.directionalHitRate)}` : '--'}</strong></span>
-          <span>盈利日 <strong>${metrics?.observations ? `${metrics.profitableDays}/${metrics.observations} · ${percentFormat(metrics.profitableDayRatio)}` : '--'}</strong></span>
-        </div>
-        ${newsNote}
-        <p>${escapeHtml(candidate.statusReason)}</p>
-      </article>
-    `;
-  }).join('') || '<div class="empty-state"><span>◇</span><strong>影子候选尚未建立</strong><p>每日任务会自动创建并持续观察</p></div>';
+  $('#paperCandidateList').innerHTML = '';
 
-  const profitLocksDisabled = paper.monthlyProfitLockEnabled?.marketNeutral === false
-    && paper.monthlyProfitLockEnabled?.trend === false;
-  const flatPositionNote = paper.pendingStrategyChange
-    ? `${paper.pendingStrategyChange.continuousTrading ? '持续交易降风险修复' : '策略变更'}将在 ${escapeHtml(paper.pendingStrategyChange.effectiveFromCycleDate)} 09:00 生效并重算仓位`
-    : profitLocksDisabled
-      ? '盈利锁已关闭；等待最新信号形成仓位，亏损风控仍保留'
-      : '可能已触发月度锁定';
+  const flatPositionNote = paper.lockReason === 'loss'
+    ? 'BTC月度亏损保护已触发' : 'BTC趋势票数或强度不足，等待下一次日线决策';
   $('#paperPositionList').innerHTML = paper.positions.length ? paper.positions.map((position) => `
     <article class="card paper-position-card ${position.side.toLowerCase()}">
       <header>

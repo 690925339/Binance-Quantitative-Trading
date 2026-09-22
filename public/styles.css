@@ -510,6 +510,7 @@ fieldset { padding: 0; border: 0; margin: 0; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.error { color: #ffd8df; border-color: rgba(240, 68, 98, .28); background: #32171d; }
 .hidden { display: none !important; }
+[hidden] { display: none !important; }
 
 @media (hover: hover) {
   .quick-actions button:hover, .template-card:hover, .configured-actions button:hover, .card-link:hover { border-color: #3a3d44; background: var(--surface-raised); }

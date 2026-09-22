@@ -341,6 +341,7 @@ test('全部新闻源失败时返回不可用状态而不是伪造新闻信号',
 test('forceRefresh 可以绕过不可用结果缓存重新抓取新闻', async () => {
   let calls = 0;
   const service = new NewsService({
+    feedRetryCount: 0,
     feeds: [{ id: 'retry', name: 'Retry Source', url: 'https://retry.test/rss', baseCredibility: 82 }],
     fetchImpl: async () => {
       calls += 1;

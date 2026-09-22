@@ -5,43 +5,32 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   addUtcDays,
-  advancePaperState,
   fetchPaperMarketData,
-  initializePaperState,
   latestCompletePaperCycleDate,
-  migratePaperStateToContinuousDeRisk,
-  MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE,
   PaperPortfolioStore,
-  paperPortfolioSnapshot,
-  writePaperReportArtifacts,
 } from '../src/monthly-accuracy-paper.js';
 import { NewsService } from '../src/news-service.js';
-import {
-  buildPaperStrategyReview,
-  PAPER_SHADOW_PROFILES,
-  paperShadowStatePath,
-  writePaperReviewArtifacts,
-} from '../src/paper-strategy-review.js';
+import { activePaperSnapshot } from '../worker/paper-scope.js';
 import {
   advanceBtcPaperState,
   btcPaperSnapshot,
   btcPaperStatePath,
   BTC_SINGLE_ASSET_PAPER_PROFILE,
+  BTC_NEWS_DATA_GUARD_PROFILE,
+  queueBtcNewsDataGuard,
   initializeBtcPaperState,
   writeBtcPaperReportArtifacts,
 } from '../src/btc-paper.js';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const stateFile = path.join(rootDir, 'data', 'runtime', 'monthly-accuracy-paper.json');
-const paperNewsDir = path.join(rootDir, 'data', 'runtime', 'paper-news-snapshots');
 const NEWS_CAPTURE_RETRY_DELAYS_MS = Object.freeze([0, 2_000, 5_000]);
 
-function paperNewsSnapshotPath(cycleDate) {
-  return path.join(paperNewsDir, `${cycleDate}.json`);
+function paperNewsSnapshotPath(cycleDate, activeRoot = rootDir) {
+  return path.join(activeRoot, 'data/runtime/paper-news-snapshots', `${cycleDate}.json`);
 }
 
-async function readPaperNewsSnapshot(cycleDate) {
-  return fs.readFile(paperNewsSnapshotPath(cycleDate), 'utf8')
+async function readPaperNewsSnapshot(cycleDate, activeRoot = rootDir) {
+  return fs.readFile(paperNewsSnapshotPath(cycleDate, activeRoot), 'utf8')
     .then((text) => JSON.parse(text))
     .catch((error) => {
       if (error.code === 'ENOENT') return null;
@@ -49,9 +38,9 @@ async function readPaperNewsSnapshot(cycleDate) {
     });
 }
 
-async function writePaperNewsSnapshot(cycleDate, news) {
-  await fs.mkdir(paperNewsDir, { recursive: true });
-  const target = paperNewsSnapshotPath(cycleDate);
+async function writePaperNewsSnapshot(cycleDate, news, activeRoot = rootDir) {
+  const target = paperNewsSnapshotPath(cycleDate, activeRoot);
+  await fs.mkdir(path.dirname(target), { recursive: true });
   const temporary = `${target}.${crypto.randomUUID()}.tmp`;
   const snapshot = {
     ...news,
@@ -63,7 +52,8 @@ async function writePaperNewsSnapshot(cycleDate, news) {
   return snapshot;
 }
 
-async function writePaperNewsCaptureAudit(cycleDate, audit) {
+async function writePaperNewsCaptureAudit(cycleDate, audit, activeRoot = rootDir) {
+  const paperNewsDir = path.join(activeRoot, 'data/runtime/paper-news-snapshots');
   await fs.mkdir(paperNewsDir, { recursive: true });
   const target = path.join(paperNewsDir, `${cycleDate}.capture.json`);
   const temporary = `${target}.${crypto.randomUUID()}.tmp`;
@@ -173,16 +163,12 @@ function signed(value, digits = 2) {
   return `${number > 0 ? '+' : ''}${number.toFixed(digits)}`;
 }
 
-function reportText(state, review, btcState = null) {
+function reportText(state) {
   const report = state.latestReport;
-  const attribution = review?.latestAttribution;
-  const candidateSummary = (review?.candidates || [])
-    .map((candidate) => `${candidate.name} ${candidate.status} ${candidate.metrics?.observations || 0}天`)
-    .join('；');
   const lines = [
     report.kind === 'initialization'
-      ? `模拟盘已于 ${report.cycleDate} 建立基线`
-      : `模拟盘日报 ${report.cycleDate}`,
+      ? `BTC模拟盘已于 ${report.cycleDate} 建立基线`
+      : `BTC模拟盘日报 ${report.cycleDate}`,
     `当日盈亏：${signed(report.dayPnl)} USDT（${signed(report.dayReturn * 100)}%）`,
     `当前净值：${Number(state.equity).toFixed(2)} USDT`,
     `累计盈亏：${signed(state.equity - state.initialCapital)} USDT（${signed((state.equity / state.initialCapital - 1) * 100)}%）`,
@@ -191,16 +177,7 @@ function reportText(state, review, btcState = null) {
     `持仓：${state.positions.length
       ? state.positions.map((item) => `${item.symbol} ${item.side === 'LONG' ? '多' : '空'} ${Math.abs(item.weightPercent).toFixed(2)}%`).join('；')
       : '空仓'}`,
-    ...(attribution ? [
-      `复盘：横截面 ${signed(attribution.marketNeutral?.totalPnl)} USDT；趋势 ${signed(attribution.trend?.totalPnl)} USDT`,
-      `最大拖累：${attribution.largestDetractor.symbol} ${signed(attribution.largestDetractor.totalPricePnl)} USDT`,
-    ] : []),
-    ...(candidateSummary ? [`影子策略：${candidateSummary}`] : []),
-    ...(btcState?.latestReport ? [
-      `BTC单币盘：${btcState.positions.length
-        ? `${btcState.positions[0].side === 'LONG' ? '多' : '空'} ${Math.abs(btcState.positions[0].weightPercent).toFixed(2)}%`
-        : '空仓'}；净值 ${Number(btcState.equity).toFixed(2)} USDT；累计 ${signed(btcState.equity - btcState.initialCapital)} USDT`,
-    ] : []),
+    '仅BTC参与结算；组合盘及相关影子盘已停用。',
   ];
   return lines.join('\n');
 }
@@ -238,7 +215,12 @@ function notifyWindows(message) {
   }
 }
 
+export function pendingPaperNewsStates({ btcState, latestCycleDate }) {
+  return !btcState || btcState.lastCycleDate < latestCycleDate ? [btcState || null] : [];
+}
+
 export async function runPaperDaily({
+  rootDir: activeRoot = rootDir,
   now = Date.now(),
   initialCapital = 10_000,
   fetchImpl = fetch,
@@ -248,31 +230,21 @@ export async function runPaperDaily({
   notify = false,
 } = {}) {
   const latestCycleDate = latestCompletePaperCycleDate(now);
-  const profiles = [MONTHLY_ACCURACY_CONTINUOUS_DERISK_PROFILE, ...PAPER_SHADOW_PROFILES];
-  const stores = [
-    new PaperPortfolioStore(stateFile),
-    ...PAPER_SHADOW_PROFILES.map((profile) => (
-      new PaperPortfolioStore(paperShadowStatePath(rootDir, profile.id))
-    )),
-  ];
-  const existingStates = await Promise.all(stores.map((store) => store.read()));
-  const pendingIndexes = existingStates
-    .map((current, index) => ({ current, index }))
-    .filter(({ current }) => !current || current.lastCycleDate < latestCycleDate);
+  const btcStore = new PaperPortfolioStore(btcPaperStatePath(activeRoot));
+  const existingBtcState = await btcStore.read();
+  const btcPending = !existingBtcState || existingBtcState.lastCycleDate < latestCycleDate;
   const newsSnapshotsByCycleDate = {};
-  const pendingNewsIndexes = pendingIndexes.filter(({ index }) => (
-    profiles[index]?.newsOverlay?.enabled
-  ));
-  if (pendingNewsIndexes.length) {
-    for (const { current } of pendingNewsIndexes) {
+  const pendingNewsStates = pendingPaperNewsStates({ btcState: existingBtcState, latestCycleDate });
+  if (pendingNewsStates.length) {
+    for (const current of pendingNewsStates) {
       let cycleDate = current ? addUtcDays(current.lastCycleDate, 1) : latestCycleDate;
       while (cycleDate < latestCycleDate) {
-        const stored = await readPaperNewsSnapshot(cycleDate);
+        const stored = await readPaperNewsSnapshot(cycleDate, activeRoot);
         if (stored) newsSnapshotsByCycleDate[cycleDate] = stored;
         cycleDate = addUtcDays(cycleDate, 1);
       }
     }
-    let latestNews = await readPaperNewsSnapshot(latestCycleDate);
+    let latestNews = await readPaperNewsSnapshot(latestCycleDate, activeRoot);
     const decisionWindow = paperNewsDecisionWindow(latestCycleDate);
     const timelyCapture = Number(now) >= decisionWindow.startsAt
       && Number(now) <= decisionWindow.endsAt;
@@ -287,69 +259,18 @@ export async function runPaperDaily({
         cycleDate: latestCycleDate,
         newsService: activeNewsService,
         now,
+        writeSnapshot: (date, news) => writePaperNewsSnapshot(date, news, activeRoot),
+        writeAudit: (date, audit) => writePaperNewsCaptureAudit(date, audit, activeRoot),
       });
+    }
+    if ((!latestNews || !isTimelyPaperNews(latestNews, latestCycleDate)) && !timelyCapture) {
+      await writePaperNewsCaptureAudit(latestCycleDate, {
+        paperCycleDate: latestCycleDate, completedAt: new Date(Number(now)).toISOString(),
+        success: false, attempts: [], reason: 'outside_decision_window',
+      }, activeRoot);
     }
     if (latestNews) newsSnapshotsByCycleDate[latestCycleDate] = latestNews;
   }
-  let marketData = null;
-  if (pendingIndexes.length) {
-    const historyStartCycleDate = pendingIndexes
-      .map(({ current }) => current?.startCycleDate || latestCycleDate)
-      .sort()[0];
-    const markStartCycleDate = pendingIndexes
-      .map(({ current }) => current ? addUtcDays(current.lastCycleDate, 1) : latestCycleDate)
-      .sort()[0];
-    marketData = await fetchPaperMarketData({
-      historyStartDate: addUtcDays(historyStartCycleDate, -220),
-      signalEndDate: addUtcDays(latestCycleDate, -1),
-      markStartCycleDate,
-      markEndCycleDate: latestCycleDate,
-      fetchImpl,
-      ...(baseUrl ? { baseUrl } : {}),
-    });
-  }
-  const states = await Promise.all(stores.map((store, index) => store.run((storedState) => {
-    const current = index === 0 && storedState
-      ? migratePaperStateToContinuousDeRisk(storedState, { now })
-      : storedState;
-    const profile = current?.profileSnapshot || profiles[index];
-    if (current && !current.profileSnapshot) {
-      current.profileSnapshot = JSON.parse(JSON.stringify(profile));
-    }
-    if (current && latestCycleDate <= current.lastCycleDate) return current;
-    if (!marketData) throw new Error('模拟盘缺少待结算行情');
-    if (!current) {
-      if (profile.newsOverlay?.enabled && !newsSnapshotsByCycleDate[latestCycleDate]) {
-        return current;
-      }
-      return initializePaperState({
-        seriesBySymbol: marketData.seriesBySymbol,
-        cycleDate: latestCycleDate,
-        markPrices: marketData.markPricesByCycleDate[latestCycleDate],
-        initialCapital,
-        now,
-        profile,
-        newsSnapshot: profile.newsOverlay?.enabled
-          ? newsSnapshotsByCycleDate[latestCycleDate] || null
-          : null,
-      });
-    }
-    return advancePaperState({
-      state: current,
-      seriesBySymbol: marketData.seriesBySymbol,
-      markPricesByCycleDate: marketData.markPricesByCycleDate,
-      throughCycleDate: latestCycleDate,
-      now,
-      profile,
-      newsSnapshotsByCycleDate: profile.newsOverlay?.enabled
-        ? newsSnapshotsByCycleDate
-        : {},
-    });
-  })));
-  const [state, ...shadowStates] = states;
-  const btcStore = new PaperPortfolioStore(btcPaperStatePath(rootDir));
-  const existingBtcState = await btcStore.read();
-  const btcPending = !existingBtcState || existingBtcState.lastCycleDate < latestCycleDate;
   let btcMarketData = null;
   const btcNewsSnapshotsByCycleDate = {};
   let btcEntryPrice = null;
@@ -368,7 +289,7 @@ export async function runPaperDaily({
     });
     for (let cycleDate = btcMarkStartCycleDate; cycleDate <= latestCycleDate; cycleDate = addUtcDays(cycleDate, 1)) {
       btcNewsSnapshotsByCycleDate[cycleDate] = newsSnapshotsByCycleDate[cycleDate]
-        || await readPaperNewsSnapshot(cycleDate)
+        || await readPaperNewsSnapshot(cycleDate, activeRoot)
         || null;
     }
     if (!existingBtcState) {
@@ -379,6 +300,7 @@ export async function runPaperDaily({
     }
   }
   const btcState = await btcStore.run((storedState) => {
+    queueBtcNewsDataGuard(storedState, now);
     if (storedState && storedState.lastCycleDate >= latestCycleDate) return storedState;
     if (!btcMarketData) throw new Error('BTC模拟盘缺少待结算行情');
     if (!storedState) {
@@ -390,6 +312,7 @@ export async function runPaperDaily({
         now,
         newsSnapshot: btcNewsSnapshotsByCycleDate[latestCycleDate],
         entryMode: 'live_mark',
+        profile: BTC_NEWS_DATA_GUARD_PROFILE,
       });
     }
     return advanceBtcPaperState({
@@ -401,18 +324,13 @@ export async function runPaperDaily({
       newsSnapshotsByCycleDate: btcNewsSnapshotsByCycleDate,
     });
   });
-  await writePaperReportArtifacts(rootDir, state);
-  await writeBtcPaperReportArtifacts(rootDir, btcState);
-  const review = buildPaperStrategyReview({ baselineState: state, shadowStates, now });
-  await writePaperReviewArtifacts(rootDir, review);
-  const text = reportText(state, review, btcState);
+  await writeBtcPaperReportArtifacts(activeRoot, btcState);
+  const snapshot = activePaperSnapshot(btcPaperSnapshot(btcState));
+  await fs.writeFile(path.join(activeRoot, 'data/runtime/btc-paper-review.json'), `${JSON.stringify(snapshot.optimizationReview, null, 2)}\n`, 'utf8');
+  const text = reportText(btcState);
   console.log(text);
   if (notify) notifyWindows(text);
-  return {
-    ...paperPortfolioSnapshot(state),
-    optimizationReview: review,
-    btcPortfolio: btcPaperSnapshot(btcState),
-  };
+  return snapshot;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

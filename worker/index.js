@@ -482,11 +482,8 @@ export function selectRuntimeState(stored, seeded) {
 }
 
 export function combinePaperPortfolioState(paper, btcPortfolio, optimizationReview) {
-  return {
-    ...(paper || {}),
-    btcPortfolio: btcPortfolio || null,
-    optimizationReview: optimizationReview || null,
-  };
+  // Keep the legacy signature, but never merge a retired account or review.
+  return activePaperSnapshot(btcPortfolio);
 }
 
 async function readState(request, env, key, seedName, fallback) {
@@ -660,19 +657,18 @@ async function api(request, env, url) {
     return json({ strategy: await createStrategy(new Request(request.url, { method: 'POST', body: JSON.stringify({ ...source, name: `${source.name} 副本`, enabled: false }) }), env) }, 201);
   }
   if (request.method === 'GET' && url.pathname === '/api/paper-portfolio') {
-    const [paper, btcPortfolio, optimizationReview] = await Promise.all([
-      readState(request, env, 'paper-portfolio', 'paper-portfolio', { status: 'not_started', reports: [], positions: [] }),
-      readState(request, env, 'btc-paper', 'btc-paper', { status: 'not_started', reports: [], positions: [], strategyType: 'btcSingleAssetTrend' }),
-      readState(request, env, 'paper-review', 'paper-review', { status: 'not_started', candidates: [] }),
-    ]);
-    return json(combinePaperPortfolioState(paper, btcPortfolio, optimizationReview));
+    const btcPortfolio = await readState(request, env, 'btc-paper', 'btc-paper', { status: 'not_started', reports: [], positions: [], strategyType: 'btcSingleAssetTrend' });
+    return json(activePaperSnapshot(btcPortfolio));
   }
   if (request.method === 'GET' && url.pathname === '/api/paper-portfolio/btc') return json(await readState(request, env, 'btc-paper', 'btc-paper', { status: 'not_started', reports: [], positions: [], strategyType: 'btcSingleAssetTrend' }));
-  if (request.method === 'GET' && url.pathname === '/api/paper-portfolio/review') return json(await readState(request, env, 'paper-review', 'paper-review', { status: 'not_started', candidates: [] }));
+  if (request.method === 'GET' && url.pathname === '/api/paper-portfolio/review') {
+    const btc = await readState(request, env, 'btc-paper', 'btc-paper', { status: 'not_started', reports: [], positions: [] });
+    return json(activePaperSnapshot(btc).optimizationReview);
+  }
   if (request.method === 'GET' && url.pathname === '/api/paper-portfolio/reports') {
     const limit = Number(url.searchParams.get('limit') || 30);
     if (!Number.isInteger(limit) || limit < 1 || limit > 365) throw httpError('日报数量必须在 1 到 365 之间');
-    const paper = await readState(request, env, 'paper-portfolio', 'paper-portfolio', { reports: [] });
+    const paper = await readState(request, env, 'btc-paper', 'btc-paper', { reports: [] });
     return json({ reports: (paper.reports || []).slice(-limit).reverse() });
   }
   if (request.method === 'GET' && url.pathname === '/api/session') {
@@ -702,3 +698,4 @@ export default {
     }
   },
 };
+import { activePaperSnapshot } from './paper-scope.js';
