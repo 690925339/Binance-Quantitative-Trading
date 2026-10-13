@@ -11,6 +11,7 @@ import {
 } from '../src/monthly-accuracy-paper.js';
 import { NewsService } from '../src/news-service.js';
 import { activePaperSnapshot } from '../worker/paper-scope.js';
+import { buildBtcDailyTarget } from '../src/btc-daily-target.js';
 import {
   advanceBtcPaperState,
   btcPaperSnapshot,
@@ -163,7 +164,7 @@ function signed(value, digits = 2) {
   return `${number > 0 ? '+' : ''}${number.toFixed(digits)}`;
 }
 
-function reportText(state) {
+export function reportText(state, dailyTarget = buildBtcDailyTarget(state)) {
   const report = state.latestReport;
   const lines = [
     report.kind === 'initialization'
@@ -173,6 +174,10 @@ function reportText(state) {
     `当前净值：${Number(state.equity).toFixed(2)} USDT`,
     `累计盈亏：${signed(state.equity - state.initialCapital)} USDT（${signed((state.equity / state.initialCapital - 1) * 100)}%）`,
     `最大回撤：${(Number(state.maxDrawdown) * 100).toFixed(2)}%`,
+    dailyTarget.account
+      ? `净盈利日比例：${(dailyTarget.account.profitableDayRatio * 100).toFixed(2)}%（${dailyTarget.account.profitableDays}/${dailyTarget.account.expectedDays}个自然结算日；目标60%；空仓、持平计入分母${dailyTarget.account.dataComplete ? '' : `；缺失${dailyTarget.account.missingDays}日，暂不验收`}）`
+      : '净盈利日比例：暂无完整结算日（目标60%；空仓、持平计入分母）',
+    '保留年化10%目标；90天及3完整月仅供复核，不自动上线或增加杠杆。',
     `当前模型总敞口：${(Number(state.modelGrossExposure) * 100).toFixed(2)}%`,
     `持仓：${state.positions.length
       ? state.positions.map((item) => `${item.symbol} ${item.side === 'LONG' ? '多' : '空'} ${Math.abs(item.weightPercent).toFixed(2)}%`).join('；')
@@ -327,7 +332,12 @@ export async function runPaperDaily({
   await writeBtcPaperReportArtifacts(activeRoot, btcState);
   const snapshot = activePaperSnapshot(btcPaperSnapshot(btcState));
   await fs.writeFile(path.join(activeRoot, 'data/runtime/btc-paper-review.json'), `${JSON.stringify(snapshot.optimizationReview, null, 2)}\n`, 'utf8');
-  const text = reportText(btcState);
+  const dailyTarget = buildBtcDailyTarget(btcState);
+  const targetFile = path.join(activeRoot, 'data/runtime/btc-daily-target.json');
+  const temporaryTarget = `${targetFile}.${crypto.randomUUID()}.tmp`;
+  await fs.writeFile(temporaryTarget, `${JSON.stringify(dailyTarget, null, 2)}\n`, 'utf8');
+  await fs.rename(temporaryTarget, targetFile);
+  const text = reportText(btcState, dailyTarget);
   console.log(text);
   if (notify) notifyWindows(text);
   return snapshot;

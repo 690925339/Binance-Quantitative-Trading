@@ -192,7 +192,10 @@ function signalAllocation(seriesBySymbol, signalDate, profile) {
   const market = normalizeSeries(seriesBySymbol, profile);
   const signalIndex = market.dateIndex.get(signalDate);
   const settings = profile.trend;
-  const warmup = Math.max(...settings.lookbackDays, settings.volatilityWindowDays);
+  if (profile.entryGuardAdverseMove != null && (!Number.isInteger(profile.entryGuardLookbackDays)
+    || profile.entryGuardLookbackDays < 1)) throw new Error('BTC短期逆向过滤窗口无效');
+  const warmup = Math.max(...settings.lookbackDays, settings.volatilityWindowDays,
+    settings.shortConfirmationLookbackDays || 0, profile.entryGuardLookbackDays || 0);
   if (!Number.isInteger(signalIndex) || signalIndex < warmup) {
     throw new Error(`${signalDate} BTC信号预热不足`);
   }
@@ -206,6 +209,8 @@ function signalAllocation(seriesBySymbol, signalDate, profile) {
   const signal = calculateTrendSignal(market.closes, signalIndex, settings);
   return {
     rawWeight: allocation.weights[profile.symbol] || 0,
+    entryGuardReturn: profile.entryGuardLookbackDays
+      ? market.closes[signalIndex] / market.closes[signalIndex - profile.entryGuardLookbackDays] - 1 : null,
     dynamicLeverage: allocation.dynamicLeverage,
     activeSignalCount: allocation.activeSignalCount,
     averageSignalStrength: allocation.averageSignalStrength,
@@ -278,29 +283,54 @@ function signalSnapshot(allocation) {
   };
 }
 
-export function evaluateBtcRebalance(previousWeight, proposedWeight, minimumIncrease = 0) {
+export function evaluateBtcRebalance(previousWeight, proposedWeight, minimumIncrease = 0, maximumIncrease = null) {
   if (!Number.isFinite(minimumIncrease) || minimumIncrease < 0 || minimumIncrease > 0.1) {
     throw new Error('BTC最小加仓阈值必须在0至10%之间');
   }
   const sameDirection = previousWeight * proposedWeight > 0;
   const increase = Math.abs(proposedWeight) - Math.abs(previousWeight);
   const deferred = sameDirection && increase > 0 && increase < minimumIncrease;
-  // Never delay a reduction, full exit or directional reversal.
-  return { minimumIncrease, deferred, targetWeight: proposedWeight,
-    executedWeight: deferred ? previousWeight : proposedWeight };
+  if (maximumIncrease !== null && (!Number.isFinite(maximumIncrease) || maximumIncrease <= 0 || maximumIncrease > 1
+    || maximumIncrease < minimumIncrease)) throw new Error('BTC每日加仓上限无效');
+  let executedWeight = deferred ? previousWeight : proposedWeight;
+  if (maximumIncrease !== null) {
+    const existingSameSide = sameDirection ? Math.abs(previousWeight) : 0;
+    executedWeight = Math.sign(executedWeight) * Math.min(Math.abs(executedWeight), existingSameSide + maximumIncrease);
+  }
+  // Reductions and exits are immediate; new opposite-side risk can still be capped.
+  return { minimumIncrease, maximumIncrease, deferred, targetWeight: proposedWeight,
+    executedWeight, increaseCapped: executedWeight !== (deferred ? previousWeight : proposedWeight) };
+}
+
+export function evaluateBtcEntryGuard(previousWeight, proposedWeight, recentReturn, threshold = null) {
+  if (threshold === null) return { active: false, targetWeight: proposedWeight };
+  if (!Number.isFinite(threshold) || threshold <= 0 || !Number.isFinite(recentReturn)) throw new Error('BTC短期逆向过滤参数无效');
+  const active = proposedWeight !== 0 && Math.sign(proposedWeight) * recentReturn <= -threshold;
+  const targetWeight = active
+    ? previousWeight * proposedWeight > 0 ? Math.sign(proposedWeight) * Math.min(Math.abs(previousWeight), Math.abs(proposedWeight)) : 0
+    : proposedWeight;
+  return { active, targetWeight, recentReturn, threshold };
 }
 
 function applyNextSignal({ state, seriesBySymbol, signalDate, cycleDate, newsSnapshot, profile }) {
   const allocation = signalAllocation(seriesBySymbol, signalDate, profile);
   const deRisk = evaluateBtcProfitDeRisk(state, profile);
-  let proposedWeight = state.lockReason === null
-    ? allocation.rawWeight * deRisk.scale
-    : 0;
+  const lossContinuationScale = profile.monthlyLossContinuationScale ?? 0;
+  if (!Number.isFinite(lossContinuationScale) || lossContinuationScale < 0 || lossContinuationScale > 0.1) {
+    throw new Error('BTC月损后研究敞口比例只能在0至10%之间');
+  }
+  const lossScale = state.lockReason === null ? 1 : state.lockReason === 'loss' ? lossContinuationScale : 0;
+  let proposedWeight = lossScale ? allocation.rawWeight * deRisk.scale * lossScale : 0;
+  if (state.lockReason === 'loss') {
+    proposedWeight = Math.sign(proposedWeight) * Math.min(Math.abs(proposedWeight), lossContinuationScale);
+  }
+  const entryGuard = evaluateBtcEntryGuard(state.weight, proposedWeight, allocation.entryGuardReturn, profile.entryGuardAdverseMove ?? null);
+  proposedWeight = entryGuard.targetWeight;
   const newsRisk = evaluateBtcNewsRisk(newsSnapshot, proposedWeight, cycleDate, profile);
   proposedWeight *= newsRisk.appliedGrossExposureScale;
   const dataQualityRisk = evaluateBtcNewsDataGuard(state.weight, proposedWeight, newsRisk, profile.newsDataQualityGuardEnabled);
   proposedWeight = dataQualityRisk.targetWeight;
-  const rebalance = evaluateBtcRebalance(state.weight, proposedWeight, profile.minimumWeightIncrease || 0);
+  const rebalance = evaluateBtcRebalance(state.weight, proposedWeight, profile.minimumWeightIncrease || 0, profile.maximumWeightIncrease ?? null);
   return {
     allocation,
     profitDeRisk: deRisk,
@@ -308,6 +338,7 @@ function applyNextSignal({ state, seriesBySymbol, signalDate, cycleDate, newsSna
     proposedWeight: rebalance.executedWeight,
     rebalance,
     dataQualityRisk,
+    entryGuard,
   };
 }
 
@@ -385,6 +416,7 @@ export function initializeBtcPaperState({
   state.lastProfitDeRisk = next.profitDeRisk;
   state.lastRebalance = next.rebalance;
   state.lastDataQualityRisk = next.dataQualityRisk;
+  state.lastEntryGuard = next.entryGuard;
   state.maxDrawdown = round(state.equity / state.peakEquity - 1);
   Object.assign(state, stateSnapshotFields(state, profile));
   const report = {
@@ -414,6 +446,7 @@ export function initializeBtcPaperState({
     profitDeRisk: state.lastProfitDeRisk,
     rebalance: state.lastRebalance,
     dataQualityRisk: state.lastDataQualityRisk,
+    entryGuard: state.lastEntryGuard,
     lockReason: state.lockReason,
     positions: state.positions,
     modelGrossExposure: state.modelGrossExposure,
@@ -498,6 +531,7 @@ export function advanceBtcPaperState({
     state.lastProfitDeRisk = next.profitDeRisk;
     state.lastRebalance = next.rebalance;
     state.lastDataQualityRisk = next.dataQualityRisk;
+    state.lastEntryGuard = next.entryGuard;
     state.peakEquity = round(Math.max(state.peakEquity, state.equity), 4);
     state.maxDrawdown = round(Math.min(state.maxDrawdown, state.equity / state.peakEquity - 1));
     state.lastCycleDate = cycleDate;
@@ -531,13 +565,16 @@ export function advanceBtcPaperState({
       profitDeRisk: state.lastProfitDeRisk,
       rebalance: state.lastRebalance,
       dataQualityRisk: state.lastDataQualityRisk,
+      entryGuard: state.lastEntryGuard,
       settledLockReason,
       lockReason: state.lockReason,
       monthChanged,
       positions: state.positions,
       modelGrossExposure: state.modelGrossExposure,
       notes: state.lockReason === 'loss'
-        ? ['BTC趋势袖套已触发1.5%月度亏损保护，本月剩余时间保持空仓。']
+        ? [profile.monthlyLossContinuationScale > 0
+          ? '研究模式：月损保护后仅保留缩减风险，绝对仓位不超过10%；不适用于当前模拟盘。'
+          : 'BTC趋势袖套已触发1.5%月度亏损保护，本月剩余时间保持空仓。']
         : [],
     };
     state.latestReport = report;
@@ -605,6 +642,7 @@ export function btcPaperSnapshot(state) {
     profitDeRisk: state.lastProfitDeRisk,
     rebalance: state.lastRebalance || null,
     dataQualityRisk: state.lastDataQualityRisk || null,
+    entryGuard: state.lastEntryGuard || null,
     pendingStrategyChange: state.pendingStrategyChange || null,
     strategyChanges: state.strategyChanges || [],
     accuracy: {
